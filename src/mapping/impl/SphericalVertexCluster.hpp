@@ -160,6 +160,7 @@ SphericalVertexCluster<RADIAL_BASIS_FUNCTION_T>::SphericalVertexCluster(
   // The IDs are sorted in the boost flat_set, hence, the function here has N log(N) complexity
   _inputIDs.insert(inIDs.begin(), inIDs.end());
   _outputIDs.insert(outIDs.begin(), outIDs.end());
+  PRECICE_DEBUG("--LYX: Cluster center: {}, inIDs: {}, outIDs: {}", center.getCoords(), inIDs, outIDs);
   eq.stop();
   // If the cluster is empty, we return immediately
   if (empty()) {
