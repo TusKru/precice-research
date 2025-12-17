@@ -1,0 +1,27 @@
+# The following files are ignored by Git
+*.[oa]
+*~
+*.exe
+*.log
+*.pyc
+.cproject
+.project
+.sconsign.dblite
+.sconf_temp
+\#*#
+.vscode
+*.DS_STORE
+core
+build
+GTAGS
+GRTAGS
+GPATH
+src/Eigen/
+docs/source-code-documentation/
+CMakeFiles
+Makefile
+src/precice/impl/versions.hpp
+src/precice/Version.h
+src/testing/SourceLocation.hpp
+.idea
+CMakeUserPresets.json

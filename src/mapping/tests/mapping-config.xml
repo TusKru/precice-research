@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<configuration>
+  <mesh name="TestMesh" dimensions="3" />
+  <mesh name="TestMeshTwo" dimensions="3" />
+  <mesh name="TestMeshThree" dimensions="3" />
+
+  <mapping:nearest-projection
+    direction="write"
+    from="TestMesh"
+    to="TestMeshThree"
+    constraint="conservative" />
+  <mapping:nearest-projection
+    direction="read"
+    from="TestMeshThree"
+    to="TestMeshTwo"
+    constraint="consistent" />
+  <mapping:nearest-projection
+    direction="write"
+    from="TestMeshTwo"
+    to="TestMesh"
+    constraint="conservative" />
+</configuration>
