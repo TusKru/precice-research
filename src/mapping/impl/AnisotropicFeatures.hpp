@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Eigen/Core>
+#include <vector>
 #include <Eigen/src/Eigenvalues/SelfAdjointEigenSolver.h>
 #include <numeric>
 
@@ -8,29 +9,99 @@
 #include "precice/impl/Types.hpp"
 
 namespace precice::mapping::impl {
-namespace {
+
 using Vertices = std::vector<mesh::Vertex>;
-}
-enum FeatureType {
-    LINEAR,
-    SURFACE,
-    VOLUMETRIC
+
+// 导引点所属的局部特征类型，对应第一步"网格局部特征识别"的产出
+enum class FeatureType {
+    LINEAR,     // 线状 (Prolate)
+    SURFACE,    // 面状 (Oblate)
+    VOLUMETRIC  // 体状 (Sphere)
 };
 
 /**
  * @brief Storage the geometric feature.
- * 
- * @param center the physical coordinates of the feature(the position of the guide point)
+ * @param position the physical coordinates of the feature(the position of the guide point)
  * @param eigenvalues the eigenvalues(lamda1-3) after PCA decomposition, used to determine the feature type
  * @param eigenvectors the eigenvector matrix(principal directions), 
  *        used to determine the rotational pose of the anisotropic ellipsoid
  * @param type the type of the feature, with enumeration options:{LINEAR, SURFACE, VOLUMETRIC}
 */
-struct LocalFeature{
-    Eigen::Vector3d center;
-    Eigen::Vector3d eigenvalues;
-    Eigen::Matrix3d eigenvectors;
+struct PilotPoint {
+    Eigen::Vector3d position;
     FeatureType type;
+    Eigen::Vector3d eigenvalues;  // lambda1 >= lambda2 >= lambda3
+    Eigen::Matrix3d eigenvectors; // 列向量 v1, v2, v3
+    int id;
+};
+
+
+// 新增：各向异性簇类 (对应注意事项 7: 存储中心和导引点ID)
+// 注意：虽然存储时尽量精简，但在运行时我们需要计算覆盖范围，
+// 因此构造函数中会立即计算出形状矩阵。
+class AnisotropicVertexCluster {
+public:
+    AnisotropicVertexCluster(const Eigen::Vector3d& center, 
+                             const PilotPoint& pilot, 
+                             double baseRadius,
+                             double shapeParameter = 3.0) // shapeParameter用于拉伸/压缩比例
+        : _center(center), _pilotID(pilot.id) 
+    {
+        PRECICE_ASSERT(baseRadius > 0, "r must be positive");
+        PRECICE_ASSERT(shapeParameter > 0 && shapeParameter < 1, "shapeParameter must be (0, 1)");
+        computeShapeMatrix(pilot, baseRadius, shapeParameter);
+    }
+
+    const Eigen::Vector3d& getCenter() const { return _center; }
+    
+    // 判断顶点是否在椭球覆盖范围内
+    // 判据: (x-c)^T * M * (x-c) <= 1.0
+    bool isCovering(const Eigen::Vector3d& vertex) const {
+        Eigen::Vector3d diff = vertex - _center;
+        return (diff.transpose() * _inverseCovariance * diff).value() <= 1.0;
+    }
+
+private:
+    Eigen::Vector3d _center;
+    int _pilotID;
+    
+    // 运行时缓存的逆协方差矩阵，用于快速判断覆盖 (Mahalanobis distance)
+    Eigen::Matrix3d _inverseCovariance; 
+
+    void computeShapeMatrix(const PilotPoint& pilot, double r, double alpha) {
+        // r: 基础半径 (由k近邻距离决定)
+        // alpha: 经验缩放系数 (注意事项4中的"固定经验值")
+        
+        Eigen::Vector3d semiAxes;
+        Eigen::Matrix3d rotation = pilot.eigenvectors; // v1, v2, v3
+
+        // 注意事项 4 & 5 的实现逻辑：
+        switch (pilot.type) {
+            case FeatureType::VOLUMETRIC: // 圆球
+                semiAxes = Eigen::Vector3d(r, r, r);
+                rotation = Eigen::Matrix3d::Identity(); // 无方向
+                break;
+
+            case FeatureType::LINEAR: // 长球 (Prolate)
+                // 长轴(v1)放大，短轴(v2, v3)为基础半径
+                semiAxes = Eigen::Vector3d(r / alpha, r, r);
+                break;
+
+            case FeatureType::SURFACE: // 扁球 (Oblate)
+                // 法向v3压缩，切向v1/v2保持
+                semiAxes = Eigen::Vector3d(r, r, r * alpha); 
+                break;
+        }
+
+        // 构建形状矩阵 M = R * S^(-2) * R^T
+        // 使得 d^2 = x^T M x <= 1
+        Eigen::Matrix3d S_inv2 = Eigen::Matrix3d::Zero();
+        S_inv2(0, 0) = 1.0 / (semiAxes[0] * semiAxes[0]);
+        S_inv2(1, 1) = 1.0 / (semiAxes[1] * semiAxes[1]);
+        S_inv2(2, 2) = 1.0 / (semiAxes[2] * semiAxes[2]);
+
+        _inverseCovariance = rotation * S_inv2 * rotation.transpose();
+    }
 };
 
 /**
@@ -58,7 +129,7 @@ Vertices samplePilotPoints(mesh::PtrMesh inMesh, const mesh::BoundingBox &bb)
         start[d] = bb.minCorner()[d] + distances[d] / 2.0;
     }
 
-    Vertices pilotPoints;
+    Vertices pilotPositions;
     std::vector<double> centerCoords(dim);
     // Fill the centers
     if (dim == 2) {
@@ -66,7 +137,7 @@ Vertices samplePilotPoints(mesh::PtrMesh inMesh, const mesh::BoundingBox &bb)
             for (int j = 0; j < nSplits; ++j) {
                 centerCoords[0] = start[0] + i * distances[0];
                 centerCoords[1] = start[1] + j * distances[1];
-                pilotPoints.emplace_back(mesh::Vertex({centerCoords, pilotPoints.size()}));
+                pilotPositions.emplace_back(mesh::Vertex({centerCoords, pilotPositions.size()}));
             }
         }
     } else if (dim == 3) {
@@ -76,31 +147,31 @@ Vertices samplePilotPoints(mesh::PtrMesh inMesh, const mesh::BoundingBox &bb)
                     centerCoords[0] = start[0] + i * distances[0];
                     centerCoords[1] = start[1] + j * distances[1];
                     centerCoords[2] = start[2] + k * distances[2];
-                    pilotPoints.emplace_back(mesh::Vertex({centerCoords, pilotPoints.size()}));
+                    pilotPositions.emplace_back(mesh::Vertex({centerCoords, pilotPositions.size()}));
                 }
             }
         }
     }
-    return pilotPoints;
+    return pilotPositions;
 }
 
 /**
  * @brief Computes the geometric features around the pilot points using PCA.
  * 
- * @param[in] pilotPoints the collection of pilot points
+ * @param[in] pilotPositions the collection of pilot points
  * @param[in] inMesh the mesh we search for the k-nearest vertices around each pilot point
  * 
  * @return a collection of LocalFeature structs representing the geometric features
  */
-std::vector<LocalFeature> computeGeometricFeatures(const Vertices &pilotPoints, const mesh::PtrMesh inMesh)
+std::vector<PilotPoint> computeGeometricFeatures(const Vertices &pilotPositions, const mesh::PtrMesh inMesh)
 {
-    std::vector<LocalFeature> features;
+    std::vector<PilotPoint> pilotPoints;
     const int kNearest = 20; // number of nearest neighbors to consider for PCA
 
-    for (const auto &pilotPoint : pilotPoints) {
+    for (const auto &pilotPosition : pilotPositions) {
         // Step 1: find k-nearest neighbors
-        auto neighborIDs = inMesh->index().getClosestVertices(pilotPoint.getCoords(), kNearest);
-        PRECICE_ASSERT(!neighborIDs.empty(), "No neighbors found for pilot point ID {}.", pilotPoint.getID());
+        auto neighborIDs = inMesh->index().getClosestVertices(pilotPosition.getCoords(), kNearest);
+        PRECICE_ASSERT(!neighborIDs.empty(), "No neighbors found for pilot point ID {}.", pilotPosition.getID());
 
         // Step 2: assemble data matrix
         Eigen::MatrixXd data(neighborIDs.size(), inMesh->getDimensions());
@@ -116,7 +187,7 @@ std::vector<LocalFeature> computeGeometricFeatures(const Vertices &pilotPoints, 
         Eigen::MatrixXd centered = data.rowwise() - mean.transpose();
         Eigen::MatrixXd cov = (centered.adjoint() * centered) / double(data.rows() - 1);
         Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigSolver(cov);
-        PRECICE_ASSERT(eigSolver.info() == Eigen::Success, "PCA Eigen decomposition failed for pilot point ID {}.", pilotPoint.getID());
+        PRECICE_ASSERT(eigSolver.info() == Eigen::Success, "PCA Eigen decomposition failed for pilot point ID {}.", pilotPosition.getID());
         Eigen::VectorXd eigenvalues = eigSolver.eigenvalues().reverse();
         Eigen::MatrixXd eigenvectors = eigSolver.eigenvectors().rowwise().reverse();
 
@@ -124,29 +195,29 @@ std::vector<LocalFeature> computeGeometricFeatures(const Vertices &pilotPoints, 
         FeatureType featureType;
         if (inMesh->getDimensions() == 3) {
             if (eigenvalues(1) / eigenvalues(0) < 0.1 && eigenvalues(2) / eigenvalues(0) < 0.1) {
-                featureType = LINEAR;
+                featureType = FeatureType::LINEAR;
             } else if (eigenvalues(2) / eigenvalues(1) < 0.1) {
-                featureType = SURFACE;
+                featureType = FeatureType::SURFACE;
             } else {
-                featureType = VOLUMETRIC;
+                featureType = FeatureType::VOLUMETRIC;
             }
         } else { // 2D case
             if (eigenvalues(1) / eigenvalues(0) < 0.1) {
-                featureType = LINEAR;
+                featureType = FeatureType::LINEAR;
             } else {
-                featureType = VOLUMETRIC;
+                featureType = FeatureType::VOLUMETRIC;
             }
         }
 
         // Step 5: store the feature
-        LocalFeature feature;
-        feature.center = mean.head<3>();
-        feature.eigenvalues = eigenvalues.head<3>();
-        feature.eigenvectors = eigenvectors.leftCols(3);
-        feature.type = featureType;
-        features.push_back(feature);
+        PilotPoint pilotPoint;
+        pilotPoint.position = mean.head<3>();
+        pilotPoint.eigenvalues = eigenvalues.head<3>();
+        pilotPoint.eigenvectors = eigenvectors.leftCols(3);
+        pilotPoint.type = featureType;
+        pilotPoints.push_back(pilotPoint);
     }
-    return features;
+    return pilotPoints;
 }
 
 /**
