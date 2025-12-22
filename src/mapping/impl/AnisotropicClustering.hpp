@@ -1,64 +1,180 @@
 #pragma once
 
-#include "mesh/Mesh.hpp"
-#include "query/Index.hpp" // R-Tree
-#include "logging/LogMacros.hpp"
-#include "AnisotropicFeatures.hpp"
 #include <vector>
 #include <random>
 #include <algorithm>
 #include <cmath>
 
+#include "mesh/Mesh.hpp"
+#include "query/Index.hpp"
+#include "AnisotropicVertexCluster.hpp"
+#include "precice/impl/Types.hpp"
+#include "mapping/RadialBasisFctSolver.hpp"
+
 namespace precice::mapping::impl {
 
+namespace {
+
 /**
- * @brief 生成各向异性子域 (研究点一·步骤二)
+ * @brief Voxel Downsampling(2D: split in 4 parts; 3D: split in 8 parts)
  * 
- * @param inputMesh 待覆盖的网格 (Source Mesh)
- * @param pilotPoints 第一步生成的导引点集
- * @param targetVerticesPerCluster 目标顶点数/cluster (用于计算基础半径)
- * @param mcSampleCount 蒙特卡洛采样的样本数 M (注意事项1)
+ * @param[in] inMesh input mesh(source mesh) for creating guide points
+ * 
+ * @return a collection of pilot points(mesh::Vertex) using for geometric feature computation
+*/
+Vertices samplePilotPoints(const mesh::PtrMesh inMesh)
+{
+    precice::mesh::BoundingBox bb = inMesh->index().getRtreeBounds();
+
+    PRECICE_ASSERT(!bb.isDefault(), "Invalid bounding box.");
+    const auto bbCenter = bb.center();
+
+    const int dim = inMesh->getDimensions();
+    PRECICE_ASSERT(dim == 2 || dim == 3, "Dimension {} not supported for pilot point sampling.", dim);
+
+    // Step 1: create voxel grid        
+    int nSplits = 2; // split each dimension in 2 parts
+    std::vector<double> distances(dim);
+    std::vector<double> start(dim);
+    for (int d = 0; d < dim; ++d) {
+        distances[d] = bb.getEdgeLength(d) / nSplits;
+        start[d] = bb.minCorner()[d] + distances[d] / 2.0;
+    }
+
+    Vertices pilotPositions;
+    std::vector<double> centerCoords(dim);
+    // Fill the centers
+    if (dim == 2) {
+        for (int i = 0; i < nSplits; ++i) {
+            for (int j = 0; j < nSplits; ++j) {
+                centerCoords[0] = start[0] + i * distances[0];
+                centerCoords[1] = start[1] + j * distances[1];
+                pilotPositions.emplace_back(mesh::Vertex({centerCoords, pilotPositions.size()}));
+            }
+        }
+    } else if (dim == 3) {
+        for (int i = 0; i < nSplits; ++i) {
+            for (int j = 0; j < nSplits; ++j) {
+                for (int k = 0; k < nSplits; ++k) {
+                    centerCoords[0] = start[0] + i * distances[0];
+                    centerCoords[1] = start[1] + j * distances[1];
+                    centerCoords[2] = start[2] + k * distances[2];
+                    pilotPositions.emplace_back(mesh::Vertex({centerCoords, pilotPositions.size()}));
+                }
+            }
+        }
+    }
+    return pilotPositions;
+}
+
+/**
+ * @brief 自适应各向异性映射的网格局部特征识别 (研究点一·步骤一)
+ * 
+ * @param[in] inMesh the mesh we search for the k-nearest vertices around each pilot point
+ * 
+ * @return a collection of LocalFeature structs representing the geometric features
+ */
+std::vector<PilotPoint> computePilotPoints(const mesh::PtrMesh inMesh)
+{
+    std::vector<PilotPoint> pilotPoints;
+    const int kNearest = 20; // number of nearest neighbors to consider for PCA
+
+    Vertices pilotPositions = samplePilotPoints(inMesh);
+
+    for (const auto &pilotPosition : pilotPositions) {
+        // Step 1: find k-nearest neighbors
+        auto neighborIDs = inMesh->index().getClosestVertices(pilotPosition.getCoords(), kNearest);
+        PRECICE_ASSERT(!neighborIDs.empty(), "No neighbors found for pilot point ID {}.", pilotPosition.getID());
+
+        // Step 2: assemble data matrix
+        Eigen::MatrixXd data(neighborIDs.size(), inMesh->getDimensions());
+        for (size_t i = 0; i < neighborIDs.size(); ++i) {
+            auto coords = inMesh->vertex(neighborIDs[i]).getCoords();
+            for (int d = 0; d < inMesh->getDimensions(); ++d) {
+                data(i, d) = coords[d];
+            }
+        }
+
+        // Step 3: perform PCA
+        Eigen::VectorXd mean = data.colwise().mean();
+        Eigen::MatrixXd centered = data.rowwise() - mean.transpose();
+        Eigen::MatrixXd cov = (centered.adjoint() * centered) / double(data.rows() - 1);
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigSolver(cov);
+        PRECICE_ASSERT(eigSolver.info() == Eigen::Success, "PCA Eigen decomposition failed for pilot point ID {}.", pilotPosition.getID());
+        Eigen::VectorXd eigenvalues = eigSolver.eigenvalues().reverse();
+        Eigen::MatrixXd eigenvectors = eigSolver.eigenvectors().rowwise().reverse();
+
+        // Step 4: determine feature type
+        FeatureType featureType;
+        if (inMesh->getDimensions() == 3) {
+            if (eigenvalues(1) / eigenvalues(0) < 0.1 && eigenvalues(2) / eigenvalues(0) < 0.1) {
+                featureType = FeatureType::LINEAR;
+            } else if (eigenvalues(2) / eigenvalues(1) < 0.1) {
+                featureType = FeatureType::SURFACE;
+            } else {
+                featureType = FeatureType::VOLUMETRIC;
+            }
+        } else { // 2D case
+            if (eigenvalues(1) / eigenvalues(0) < 0.1) {
+                featureType = FeatureType::LINEAR;
+            } else {
+                featureType = FeatureType::VOLUMETRIC;
+            }
+        }
+
+        // Step 5: store the feature
+        PilotPoint pilotPoint;
+        pilotPoint.position = mean.head<3>();
+        pilotPoint.eigenvalues = eigenvalues.head<3>();
+        pilotPoint.eigenvectors = eigenvectors.leftCols(3);
+        pilotPoint.type = featureType;
+        pilotPoints.push_back(pilotPoint);
+    }
+    return pilotPoints;
+}
+} // namespace
+
+/**
+ * @brief 生成各向异性簇 (研究点一·步骤二)
+ * 
+ * @param[in] inputMesh 待覆盖的网格 (Source Mesh)
+ * @param[in] pilotPoints 第一步生成的导引点集
+ * @param[in] targetVerticesPerCluster 目标顶点数/cluster (用于计算基础半径)
+ * 
  * @return std::vector<AnisotropicVertexCluster> 生成的簇列表
  */
-std::vector<AnisotropicVertexCluster> generateAnisotropicSubdomains(
-    const mesh::Mesh& inputMesh,
-    const std::vector<PilotPoint>& pilotPoints,
-    unsigned int targetVerticesPerCluster,
-    unsigned int mcSampleCount = 10) 
+std::vector<AnisotropicVertexCluster> createAnisotropicClustering(const mesh::PtrMesh inMesh, unsigned int targetVerticesPerCluster) 
 {
-    preciceTrace2("generateAnisotropicSubdomains", targetVerticesPerCluster, mcSampleCount);
+    unsigned int mcSampleCount = 10;
+    double shapeParameter = 3.0;
 
     // 1. 准备数据结构
     std::vector<AnisotropicVertexCluster> clusters;
-    int vertexCount = inputMesh.vertices().size();
+    int vertexCount = inMesh->vertices().size();
     if (vertexCount == 0) return clusters;
 
-    // 映射表/Bool数组标记覆盖状态 (注意事项1: 推荐使用vector<bool>以节省空间)
+    // vector<bool>标记覆盖状态
     std::vector<bool> isCovered(vertexCount, false);
     int coveredCount = 0;
 
-    // 构建Pilot Points的查询索引，用于快速查找最近导引点 (注意事项2)
-    // 这里需要将PilotPoint转换为preCICE可查询的格式，此处简化假设已有构建好的Index
-    // 在实际集成中，可能需要临时构建一个只包含PilotPoint坐标的Mesh用于构建Tree
+    std::vector<PilotPoint> pilotPoints = computePilotPoints(inMesh);
+
+    // Pilot Points的查询索引，用于快速查找最近导引点
     mesh::Mesh pilotMesh("PilotMesh", 3, false);
     for(const auto& p : pilotPoints) {
         pilotMesh.createVertex(p.position);
     }
-    query::Index pilotIndex(pilotMesh); // 构建R-Tree/KD-Tree
-    pilotIndex.build();
+    query::Index pilotIndex(pilotMesh);
 
-    // 构建输入网格的查询索引，用于计算基础半径 (注意事项3)
-    query::Index inputIndex(inputMesh); 
-    inputIndex.build();
+    // 输入网格的查询索引，用于计算基础半径
+    query::Index inputIndex(inMesh); 
 
-    // 随机数生成器
-    std::mt19937 rng(12345); // 固定种子便于复现
+    // 随机数生成器，固定种子便于复现
+    std::mt19937 rng(12345);
     std::uniform_int_distribution<int> dist(0, vertexCount - 1);
+    int candidateID = dist(rng);
 
-    // 用于存储生成的Cluster中心，便于计算FPS距离
-    // 注意：preCICE的query::Index不支持动态插入，所以我们可能需要线性扫描或分批重建
-    // 为保证性能，FPS阶段若Cluster数量不多，可直接线性计算距离；若多，需优化。
-    // 这里采用：维护一个简单的中心点列表
+    // 一个简单的中心点列表，用于存储生成的Cluster中心
     std::vector<Eigen::Vector3d> clusterCenters;
 
     // 2. 迭代生成Cluster
@@ -75,18 +191,15 @@ std::vector<AnisotropicVertexCluster> generateAnisotropicSubdomains(
         for (unsigned int i = 0; i < mcSampleCount; ++i) {
             int candidateID = dist(rng);
             
-            // 如果已经被覆盖，跳过 (或寻找下一个未覆盖的)
+            // 如果已经被覆盖，跳过 (或寻找下一个未覆盖的)，可能多次无法找到簇
             if (isCovered[candidateID]) continue;
 
-            const auto& candidatePos = inputMesh.vertices()[candidateID].getCoords();
+            const auto& candidatePos = inMesh->vertices()[candidateID].getCoords();
 
             // 计算该候选点到"现有簇"的最短距离
             double distToClosestCluster = std::numeric_limits<double>::max();
             
-            if (clusterCenters.empty()) {
-                // 第一个簇，距离无穷大，直接选中
-                distToClosestCluster = std::numeric_limits<double>::max();
-            } else {
+            if (!clusterCenters.empty()) {
                 // 这里简化为线性扫描现有中心。
                 // 随着簇数量增加，这里可以用 query::Index 优化，但考虑到FPS只需采样M个，
                 // M * N_clusters 的开销通常可接受。
@@ -96,7 +209,6 @@ std::vector<AnisotropicVertexCluster> generateAnisotropicSubdomains(
                 }
             }
 
-            // FPS核心：选出"离现有簇最远"的那个候选点
             if (distToClosestCluster > maxDistToExisting) {
                 maxDistToExisting = distToClosestCluster;
                 bestCandidateID = candidateID;
@@ -111,47 +223,73 @@ std::vector<AnisotropicVertexCluster> generateAnisotropicSubdomains(
         failures = 0; // 重置失败计数
 
         // 选定新中心
-        const auto& newCenterPos = inputMesh.vertices()[bestCandidateID].getCoords();
+        const auto& newCenterPos = inMesh->vertices()[bestCandidateID].getCoords();
 
-        // --- 步骤 B: 继承导引点特征 (注意事项2 & 7) ---
+        // --- 步骤 B: 继承导引点特征 ---
         // 找到最近的导引点
-        int nearestPilotIndex = pilotIndex.getClosestVertexID(newCenterPos);
+        int nearestPilotIndex = pilotIndex.getClosestVertex(newCenterPos).index;
         const PilotPoint& nearestPilot = pilotPoints[nearestPilotIndex];
 
-        // --- 步骤 C: 确定尺寸 (注意事项3) ---
+        // --- 步骤 C: 确定尺寸 ---
         // 查询最近的 targetVerticesPerCluster 个邻居
-        auto neighbors = inputIndex.getKNearestNeighborIDs(newCenterPos, targetVerticesPerCluster);
+        auto kNearestVertexIDs = inputIndex.getClosestVertices(newCenterPos, targetVerticesPerCluster);
         
         double baseRadius = 0.0;
-        if (!neighbors.empty()) {
+        if (!kNearestVertexIDs.empty()) {
             // 选择最远的一个邻居距离作为基础半径
-            int furthestNeighborID = neighbors.back(); // preCICE返回的通常按距离排序，需确认API细节
-            baseRadius = (inputMesh.vertices()[furthestNeighborID].getCoords() - newCenterPos).norm();
+            std::vector<double> squardRadius(kNearestVertexIDs.size());
+            std::transform(kNearestVertexIDs.begin(), kNearestVertexIDs.end(), squardRadius.begin(), [&inMesh, bestCandidateID](auto i){
+                return computeSquaredDifference(inMesh->vertex(i).rawCoords(), inMesh->vertex(bestCandidateID).rawCoords());
+            });
+            auto squardBaseRadius = std::max_element(squardRadius.begin(), squardRadius.end());
+            baseRadius = std::sqrt(*squardBaseRadius);
         }
         
-        // 防止半径过小 (fallback)
-        if (baseRadius < 1e-6) baseRadius = 0.01; // 需根据问题尺度调整
+        // 防止半径过小
+        PRECICE_ASSERT(baseRadius > 1e-6, "Anisotropic cluster radius is smaller than 1e-6");
 
-        // --- 步骤 D: 创建各向异性簇 (注意事项4 & 5) ---
-        // 参数 3.0 是长轴放大倍数或短轴缩小倍数 (经验值)
-        AnisotropicVertexCluster newCluster(newCenterPos, nearestPilot, baseRadius, 3.0);
+        // --- 步骤 D: 创建各向异性簇 ---
+        AnisotropicVertexCluster newCluster(newCenterPos, nearestPilot, baseRadius, shapeParameter);
         
         clusters.push_back(newCluster);
         clusterCenters.push_back(newCenterPos);
 
-        // --- 步骤 E: 更新覆盖状态 (注意事项6) ---
-        // 这里需要高效地找出新簇覆盖了哪些点。
+        // --- 步骤 E: 更新覆盖状态 ---
         // 粗筛：利用 R-Tree 找新簇包围盒内的点
         // 精筛：用 Mahalanobis 距离判断
-        
-        // 估算最大搜索半径 (取最长轴)
-        double searchRadius = baseRadius * 3.0; // 对应上面的 shapeParameter
-        auto candidateIndices = inputIndex.getWindowIndices(newCenterPos, searchRadius);
+        if (nearestPilot.type == FeatureType::LINEAR) {
+            // 面状为基础半径再压扁，体状为基础半径的圆球，因此最大搜索半径均为基础半径
+            double searchRadius = baseRadius * shapeParameter;
+            auto candidateIndices = inputIndex.getClosestVertices(newCenterPos, searchRadius);
 
-        for (int idx : candidateIndices) {
-            if (isCovered[idx]) continue;
+            for (int idx : candidateIndices) {
+                if (isCovered[idx]) continue;
 
-            if (newCluster.isCovering(inputMesh.vertices()[idx].getCoords())) {
+                if (newCluster.isCovering(inMesh->vertices()[idx].getCoords())) {
+                    isCovered[idx] = true;
+                    coveredCount++;
+                }
+            }
+        } else if (nearestPilot.type == FeatureType::SURFACE) {
+            // 面状为基础半径再压扁，体状为基础半径的圆球，因此最大搜索半径均为基础半径
+            double searchRadius = baseRadius;
+            auto candidateIndices = inputIndex.getClosestVertices(newCenterPos, searchRadius);
+
+            for (int idx : candidateIndices) {
+                if (isCovered[idx]) continue;
+
+                if (newCluster.isCovering(inMesh->vertices()[idx].getCoords())) {
+                    isCovered[idx] = true;
+                    coveredCount++;
+                }
+            }
+        } else if (nearestPilot.type == FeatureType::VOLUMETRIC) {
+            double searchRadius = baseRadius;
+            auto candidateIndices = inputIndex.getClosestVertices(newCenterPos, searchRadius);
+
+            for (int idx : candidateIndices) {
+                if (isCovered[idx]) continue;
+
                 isCovered[idx] = true;
                 coveredCount++;
             }
