@@ -11,7 +11,7 @@
 #include "precice/impl/Types.hpp"
 #include "mapping/RadialBasisFctSolver.hpp"
 
-namespace precice::mapping::impl {
+namespace precice::mapping {
 
 namespace {
 
@@ -22,7 +22,7 @@ namespace {
  * 
  * @return a collection of pilot points(mesh::Vertex) using for geometric feature computation
 */
-Vertices samplePilotPoints(const mesh::PtrMesh inMesh)
+Vertices samplePilotPositions(const mesh::PtrMesh inMesh)
 {
     precice::mesh::BoundingBox bb = inMesh->index().getRtreeBounds();
 
@@ -79,7 +79,7 @@ std::vector<PilotPoint> computePilotPoints(const mesh::PtrMesh inMesh)
     std::vector<PilotPoint> pilotPoints;
     const int kNearest = 20; // number of nearest neighbors to consider for PCA
 
-    Vertices pilotPositions = samplePilotPoints(inMesh);
+    Vertices pilotPositions = samplePilotPositions(inMesh);
 
     for (const auto &pilotPosition : pilotPositions) {
         // Step 1: find k-nearest neighbors
@@ -143,13 +143,14 @@ std::vector<PilotPoint> computePilotPoints(const mesh::PtrMesh inMesh)
  * 
  * @return std::vector<AnisotropicVertexCluster> 生成的簇列表
  */
-std::vector<AnisotropicVertexCluster> createAnisotropicClustering(const mesh::PtrMesh inMesh, unsigned int targetVerticesPerCluster) 
+template <typename RADIDAL_BASIS_FUNCTION_T>
+std::vector<AnisotropicVertexCluster<RADIDAL_BASIS_FUNCTION_T>> createAnisotropicClustering(const mesh::PtrMesh inMesh, unsigned int targetVerticesPerCluster) 
 {
     unsigned int mcSampleCount = 10;
     double shapeParameter = 3.0;
 
     // 1. 准备数据结构
-    std::vector<AnisotropicVertexCluster> clusters;
+    std::vector<AnisotropicVertexCluster<RADIDAL_BASIS_FUNCTION_T>> clusters;
     int vertexCount = inMesh->vertices().size();
     if (vertexCount == 0) return clusters;
 
