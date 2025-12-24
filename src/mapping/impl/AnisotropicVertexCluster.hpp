@@ -55,21 +55,11 @@ public:
     /// Evaluates a conservative mapping and agglomerates the result in the given output data
     void mapConservative(const time::Sample &inData, Eigen::VectorXd &outData) const;
 
-    /// Computes and saves the RBF coefficients
-    // void computeCacheData(const Eigen::Ref<const Eigen::MatrixXd> &globalIn, Eigen::MatrixXd &polyOut, Eigen::MatrixXd &coefficientsOut) const;
-
     /// Evaluates a consistent mapping and agglomerates the result in the given output data
     void mapConsistent(const time::Sample &inData, Eigen::VectorXd &outData) const;
-
-    /// Set the normalized weight for the given \p vertexID in the outputMesh
-    // void setNormalizedWeight(double normalizedWeight, VertexID vertexID);
-
-    // void evaluateConservativeCache(Eigen::MatrixXd &epsilon, const Eigen::MatrixXd &Au, Eigen::Ref<Eigen::MatrixXd> out);
-
+    
     /// Compute the weight for a given vertex
     double computeWeight(const mesh::Vertex &v) const;
-
-    // Eigen::VectorXd interpolateAt(const mesh::Vertex &v, const Eigen::MatrixXd &poly, const Eigen::MatrixXd &coeffs, const mesh::Mesh &inMesh) const;
     
     /// Number of input vertices this partition operates on
     unsigned int getNumberOfInputVertices() const;
@@ -83,16 +73,26 @@ public:
     /// Returns, whether the current cluster is empty or not, where empty means that there
     /// are either no input vertices or output vertices.
     bool empty() const;
+    
+    /// Set the normalized weight for the given \p vertexID in the outputMesh
+    void setNormalizedWeight(double normalizedWeight, VertexID vertexID);
 
-    // void addWriteDataToCache(const mesh::Vertex &v, const Eigen::VectorXd &load, Eigen::MatrixXd &epsilon, Eigen::MatrixXd &Au,
-    //                         const mesh::Mesh &inMesh);
+    /// Computes and saves the RBF coefficients
+    void computeCacheData(const Eigen::Ref<const Eigen::MatrixXd> &globalIn, Eigen::MatrixXd &polyOut, Eigen::MatrixXd &coefficientsOut) const;
 
-    // void initializeCacheData(Eigen::MatrixXd &polynomial, Eigen::MatrixXd &coeffs, const int nComponents);
+    void evaluateConservativeCache(Eigen::MatrixXd &epsilon, const Eigen::MatrixXd &Au, Eigen::Ref<Eigen::MatrixXd> out);
+
+
+    Eigen::VectorXd interpolateAt(const mesh::Vertex &v, const Eigen::MatrixXd &poly, const Eigen::MatrixXd &coeffs, const mesh::Mesh &inMesh) const;
+
+    void addWriteDataToCache(const mesh::Vertex &v, const Eigen::VectorXd &load, Eigen::MatrixXd &epsilon, Eigen::MatrixXd &Au,
+                             const mesh::Mesh &inMesh);
+
+    void initializeCacheData(Eigen::MatrixXd &polynomial, Eigen::MatrixXd &coeffs, const int nComponents);
 
     // ------------------------------- Others ----------------------------
 
-    // 判断顶点是否在椭球覆盖范围内
-    // 判据: (x-c)^T * M * (x-c) <= 1.0
+    // 判断顶点是否在椭球覆盖范围内，判据: (x-c)^T * M * (x-c) <= 1.0
     bool isCovering(const Eigen::Vector3d& vertex) const;
 
     void computeShapeMatrix(const PilotPoint& pilot, double r, double alpha);
@@ -129,9 +129,6 @@ private:
     Polynomial _polynomial;
 
     RADIAL_BASIS_FUNCTION_T _function;
-
-    /// The weighting function
-    CompactPolynomialC2 _weightingFunction;
 
     /// Boolean switch in order to indicate that a mapping was computed
     bool _hasComputedMapping = false;
@@ -217,6 +214,84 @@ AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
     _hasComputedMapping = true;
 }
 
+template <typename RADIAL_BASIS_FUNCTION_T>
+void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::mapConservative(const time::Sample &inData, Eigen::VectorXd &outData) const
+{
+  // First, a few sanity checks. Empty partitions shouldn't be stored at all
+  PRECICE_ASSERT(!empty());
+  PRECICE_ASSERT(_hasComputedMapping);
+  PRECICE_ASSERT(_normalizedWeights.size() == static_cast<Eigen::Index>(_outputIDs.size()));
+
+  // Define an alias for data dimension in order to avoid ambiguity
+  const unsigned int nComponents = inData.dataDims;
+  const auto        &localInData = inData.values;
+
+  // TODO: We can probably reduce the temporary allocations here
+  Eigen::VectorXd in(_rbfSolver.getOutputSize());
+
+  // Now we perform the data mapping component-wise
+  for (unsigned int c = 0; c < nComponents; ++c) {
+    // Step 1: extract the relevant input data from the global input data and store
+    // it in a contiguous array, which is required for the RBF solver
+    for (unsigned int i = 0; i < _outputIDs.size(); ++i) {
+      const auto dataIndex = *(_outputIDs.nth(i));
+      PRECICE_ASSERT(dataIndex * nComponents + c < localInData.size(), dataIndex * nComponents + c, localInData.size());
+      PRECICE_ASSERT(_normalizedWeights[i] > 0, _normalizedWeights[i], i);
+      // here, we also directly apply the weighting, i.e., we split the input data
+      in[i] = localInData[dataIndex * nComponents + c] * _normalizedWeights[i];
+    }
+
+    // Step 2: solve the system using a conservative constraint
+    auto result = _rbfSolver.solveConservative(in, _polynomial);
+    PRECICE_ASSERT(result.size() == static_cast<Eigen::Index>(_inputIDs.size()));
+
+    // Step 3: now accumulate the result into our global output data
+    for (unsigned int i = 0; i < _inputIDs.size(); ++i) {
+      const auto dataIndex = *(_inputIDs.nth(i));
+      PRECICE_ASSERT(dataIndex * nComponents + c < outData.size(), dataIndex * nComponents + c, outData.size());
+      outData[dataIndex * nComponents + c] += result(i);
+    }
+  }
+}
+
+template <typename RADIAL_BASIS_FUNCTION_T>
+void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::mapConsistent(const time::Sample &inData, Eigen::VectorXd &outData) const
+{
+  // First, a few sanity checks. Empty partitions shouldn't be stored at all
+  PRECICE_ASSERT(!empty());
+  PRECICE_ASSERT(_hasComputedMapping);
+  PRECICE_ASSERT(_normalizedWeights.size() == static_cast<Eigen::Index>(_outputIDs.size()));
+
+  // Define an alias for data dimension in order to avoid ambiguity
+  const unsigned int nComponents = inData.dataDims;
+  const auto        &localInData = inData.values;
+
+  Eigen::VectorXd in(_rbfSolver.getInputSize());
+
+  // Now we perform the data mapping component-wise
+  for (unsigned int c = 0; c < nComponents; ++c) {
+    // Step 1: extract the relevant input data from the global input data and store
+    // it in a contiguous array, which is required for the RBF solver (last polyparams entries remain zero)
+    for (unsigned int i = 0; i < _inputIDs.size(); i++) {
+      const auto dataIndex = *(_inputIDs.nth(i));
+      PRECICE_ASSERT(dataIndex * nComponents + c < localInData.size(), dataIndex * nComponents + c, localInData.size());
+      in[i] = localInData[dataIndex * nComponents + c];
+    }
+
+    // Step 2: solve the system using a consistent constraint
+    auto result = _rbfSolver.solveConsistent(in, _polynomial);
+    PRECICE_ASSERT(static_cast<Eigen::Index>(_outputIDs.size()) == result.size());
+
+    // Step 3: now accumulate the result into our global output data
+    for (unsigned int i = 0; i < _outputIDs.size(); ++i) {
+      const auto dataIndex = *(_outputIDs.nth(i));
+      PRECICE_ASSERT(dataIndex * nComponents + c < outData.size(), dataIndex * nComponents + c, outData.size());
+      PRECICE_ASSERT(_normalizedWeights[i] > 0);
+      // here, we also directly apply the weighting, i.e., split the result data
+      outData[dataIndex * nComponents + c] += result(i) * _normalizedWeights[i];
+    }
+  }
+}
 
 template <typename RADIAL_BASIS_FUNCTION_T>
 bool AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::isCovering(const Eigen::Vector3d& vertex) const 
@@ -293,52 +368,97 @@ unsigned int AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::getNumberOfInput
     return _inputIDs.size();
 }
 
-// @todo
-template <typename RADIAL_BASIS_FUNCTION_T>
-void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::mapConservative(const time::Sample &inData, Eigen::VectorXd &outData) const
-{
-    SphericalVertexCluster<RADIAL_BASIS_FUNCTION_T>::mapConservative(inData, outData);
-}
-
-template <typename RADIAL_BASIS_FUNCTION_T>
-void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::mapConsistent(const time::Sample &inData, Eigen::VectorXd &outData) const
-{
-    SphericalVertexCluster<RADIAL_BASIS_FUNCTION_T>::mapConsistent(inData, outData);
-}
-
 template <typename RADIAL_BASIS_FUNCTION_T>
 double AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeWeight(const mesh::Vertex &v) const
 {
-    // auto c = this->getCenterCoords();
-    // Eigen::Vector3d center(c[0], c[1], c[2]);
-    // auto rv = v.rawCoords();
-    // Eigen::Vector3d pv(rv[0], rv[1], rv[2]);
-    // Eigen::Vector3d diff = pv - center;
-    // const double d2 = diff.transpose() * _inverseCovariance * diff;
-    // const double d  = std::sqrt(std::max(d2, 0.0));
-    // CompactPolynomialC2 wf(_radius);
-    // return wf.evaluate(d);
-
-    Eigen::Vector3d centerVec(this->_center.coord(0), this->_center.coord(1), this->_center.coord(2));
-    Eigen::Vector3d vVec;
-    if (v.getDimensions() == 3) {
-        vVec << v.coord(0), v.coord(1), v.coord(2);
-    } else {
-        vVec << v.coord(0), v.coord(1), 0.0;
-    }
+    auto c = getCenterCoords();
+    Eigen::Vector3d center(c[0], c[1], c[2]);
     
-    Eigen::Vector3d diff = vVec - centerVec;
-    double distSq = (diff.transpose() * _inverseCovariance * diff).value();
+    auto rv = v.rawCoords();
+    Eigen::Vector3d pv(rv[0], rv[1], rv[2]);
     
-    if (distSq > 1.0 + math::NUMERICAL_ZERO_DIFFERENCE) {
+    Eigen::Vector3d diff = pv - center;
+    
+    const double d2 = diff.transpose() * _inverseCovariance * diff;
+    
+    if (d2 > 1.0 + math::NUMERICAL_ZERO_DIFFERENCE) {
         return 0.0;
     }
     
-    // Clamp to 1.0 to avoid numerical issues with sqrt(>1) if slightly over
-    if (distSq > 1.0) distSq = 1.0;
+    return std::sqrt(d2);
+}
 
-    // Use the updated weighting function (radius 1.0)
-    return this->_weightingFunction.evaluate(std::sqrt(distSq));
+template <typename RADIAL_BASIS_FUNCTION_T>
+void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::setNormalizedWeight(double normalizedWeight, VertexID vertexID)
+{
+    PRECICE_ASSERT(_outputIDs.size() > 0);
+    PRECICE_ASSERT(_outputIDs.contains(vertexID), vertexID);
+    PRECICE_ASSERT(normalizedWeight >= 0.0, normalizedWeight);
+
+    if (_normalizedWeights.size() == 0)
+        _normalizedWeights.resize(_outputIDs.size());
+
+    // The find method of boost flat_set comes with O(log(N)) complexity (the more expensive part here)
+    auto localID = _outputIDs.index_of(_outputIDs.find(vertexID));
+
+    PRECICE_ASSERT(static_case<Eigen::Index>(localID) < _normalizedWeights.size(), localID, _normalizedWeights.size());
+    _normalizedWeights[localID] = normalizedWeight;
+}
+
+// @todo
+
+template <typename RADIAL_BASIS_FUNCTION_T>
+void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::evaluateConservativeCache(Eigen::MatrixXd &epsilon, const Eigen::MatrixXd &Au, Eigen::Ref<Eigen::MatrixXd> out)
+{
+  Eigen::MatrixXd localIn(_inputIDs.size(), Au.cols());
+  _rbfSolver.evaluateConservativeCache(epsilon, Au, localIn);
+  // Step 3: now accumulate the result into our global output data
+  for (std::size_t i = 0; i < _inputIDs.size(); ++i) {
+    const auto dataIndex = *(_inputIDs.nth(i));
+    PRECICE_ASSERT(dataIndex < out.cols(), out.cols());
+    out.col(dataIndex) += localIn.row(i);
+  }
+}
+
+template <typename RADIAL_BASIS_FUNCTION_T>
+void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeCacheData(const Eigen::Ref<const Eigen::MatrixXd> &globalIn, Eigen::MatrixXd &polyOut, Eigen::MatrixXd &coeffOut) const
+{
+  PRECICE_TRACE();
+  Eigen::MatrixXd in(_rbfSolver.getInputSize(), globalIn.rows());
+  // Step 1: extract the relevant input data from the global input data and store
+  // it in a contiguous array, which is required for the RBF solver (last polyparams entries remain zero)
+  for (std::size_t i = 0; i < _inputIDs.size(); i++) {
+    const auto dataIndex = *(_inputIDs.nth(i));
+    PRECICE_ASSERT(dataIndex < globalIn.cols(), globalIn.cols());
+    in.row(i) = globalIn.col(dataIndex);
+  }
+  // Step 2: solve the system using a consistent constraint
+  _rbfSolver.computeCacheData(in, _polynomial, polyOut, coeffOut);
+}
+
+template <typename RADIAL_BASIS_FUNCTION_T>
+Eigen::VectorXd AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::interpolateAt(const mesh::Vertex &v, const Eigen::MatrixXd &poly, const Eigen::MatrixXd &coeffs, const mesh::Mesh &inMesh) const
+{
+  PRECICE_TRACE();
+  return _rbfSolver.interpolateAt(v, poly, coeffs, _function, _inputIDs, inMesh);
+}
+
+template <typename RADIAL_BASIS_FUNCTION_T>
+void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::addWriteDataToCache(const mesh::Vertex &v, const Eigen::VectorXd &load,
+                                                                          Eigen::MatrixXd &epsilon, Eigen::MatrixXd &Au,
+                                                                          const mesh::Mesh &inMesh)
+{
+  PRECICE_TRACE();
+  _rbfSolver.addWriteDataToCache(v, load, epsilon, Au, _function, _inputIDs, inMesh);
+}
+
+template <typename RADIAL_BASIS_FUNCTION_T>
+void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::initializeCacheData(Eigen::MatrixXd &poly, Eigen::MatrixXd &coeffs, const int nComponents)
+{
+  if (Polynomial::SEPARATE == _polynomial) {
+    poly.resize(_rbfSolver.getNumberOfPolynomials(), nComponents);
+  }
+  coeffs.resize(_inputIDs.size(), nComponents);
 }
 
 } // namespace precice::mapping
