@@ -49,7 +49,7 @@ Vertices samplePilotPositions(const mesh::PtrMesh inMesh)
             for (int j = 0; j < nSplits; ++j) {
                 centerCoords[0] = start[0] + i * distances[0];
                 centerCoords[1] = start[1] + j * distances[1];
-                pilotPositions.emplace_back(mesh::Vertex({centerCoords, pilotPositions.size()}));
+                pilotPositions.emplace_back(mesh::Vertex({centerCoords, static_cast<VertexID>(pilotPositions.size())}));
             }
         }
     } else if (dim == 3) {
@@ -59,7 +59,7 @@ Vertices samplePilotPositions(const mesh::PtrMesh inMesh)
                     centerCoords[0] = start[0] + i * distances[0];
                     centerCoords[1] = start[1] + j * distances[1];
                     centerCoords[2] = start[2] + k * distances[2];
-                    pilotPositions.emplace_back(mesh::Vertex({centerCoords, pilotPositions.size()}));
+                    pilotPositions.emplace_back(mesh::Vertex({centerCoords, static_cast<VertexID>(pilotPositions.size())}));
                 }
             }
         }
@@ -143,14 +143,14 @@ std::vector<PilotPoint> computePilotPoints(const mesh::PtrMesh inMesh)
  * 
  * @return std::vector<AnisotropicVertexCluster> 生成的簇列表
  */
-template <typename RADIDAL_BASIS_FUNCTION_T>
-std::vector<AnisotropicVertexCluster<RADIDAL_BASIS_FUNCTION_T>> createAnisotropicClustering(const mesh::PtrMesh inMesh, unsigned int targetVerticesPerCluster) 
+template <typename RADIAL_BASIS_FUNCTION_T>
+std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>> createAnisotropicClustering(const mesh::PtrMesh inMesh,const mesh::PtrMesh outMesh,  RADIAL_BASIS_FUNCTION_T function, Polynomial polynomial, unsigned int targetVerticesPerCluster) 
 {
     unsigned int mcSampleCount = 10;
     double shapeParameter = 3.0;
 
     // 1. 准备数据结构
-    std::vector<AnisotropicVertexCluster<RADIDAL_BASIS_FUNCTION_T>> clusters;
+    std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>> clusters;
     int vertexCount = inMesh->vertices().size();
     if (vertexCount == 0) return clusters;
 
@@ -225,7 +225,7 @@ std::vector<AnisotropicVertexCluster<RADIDAL_BASIS_FUNCTION_T>> createAnisotropi
 
         // 选定新中心
         const auto& newCenterPos = inMesh->vertices()[bestCandidateID].getCoords();
-
+        const auto& newCenterVertex = inMesh->vertices()[bestCandidateID];
         // --- 步骤 B: 继承导引点特征 ---
         // 找到最近的导引点
         int nearestPilotIndex = pilotIndex.getClosestVertex(newCenterPos).index;
@@ -250,7 +250,7 @@ std::vector<AnisotropicVertexCluster<RADIDAL_BASIS_FUNCTION_T>> createAnisotropi
         PRECICE_ASSERT(baseRadius > 1e-6, "Anisotropic cluster radius is smaller than 1e-6");
 
         // --- 步骤 D: 创建各向异性簇 ---
-        AnisotropicVertexCluster newCluster(newCenterPos, nearestPilot, baseRadius, shapeParameter);
+        AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T> newCluster(newCenterVertex, baseRadius, function, polynomial, inMesh, outMesh, nearestPilot, shapeParameter);
         
         clusters.push_back(newCluster);
         clusterCenters.push_back(newCenterPos);

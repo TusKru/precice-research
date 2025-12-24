@@ -92,6 +92,8 @@ public:
 
     // ------------------------------- Others ----------------------------
 
+    void computeNormalizedWeights();
+
     // 判断顶点是否在椭球覆盖范围内，判据: (x-c)^T * M * (x-c) <= 1.0
     bool isCovering(const Eigen::Vector3d& vertex) const;
 
@@ -157,7 +159,7 @@ AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
     mesh::PtrMesh outputMesh,
     const PilotPoint& pilot, 
     double shapeParameter
-) : _pilotID(pilot.id), _center(center), _radius(radius), _polynomial(polynomial), _function(function), _weightingFunction(radius)
+) : _pilotID(pilot.id), _center(center), _radius(radius), _polynomial(polynomial), _function(function)
 {
     // 1. Compute Shape Matrix and Transformation components
     PRECICE_ASSERT(radius > 0, "r must be positive");
@@ -166,12 +168,14 @@ AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
 
     // 2. Identify input and output vertex IDs within the anisotropic ellipsoidal region
     // We first get candidates within a bounding sphere, then filter based on Mahalanobis distance
+    mesh::Mesh::VertexOffsets inIDs, outIDs;
+
     if (pilot.type == FeatureType::LINEAR) {
-        auto inIDs = inputMesh->index().getVerticesInsideBox(center, radius * shapeParameter);
-        auto outIDs = outputMesh->index().getVerticesInsideBox(center, radius * shapeParameter);
+        inIDs = inputMesh->index().getVerticesInsideBox(center, radius * shapeParameter);
+        outIDs = outputMesh->index().getVerticesInsideBox(center, radius * shapeParameter);
     } else {
-        auto inIDs = inputMesh->index().getVerticesInsideBox(center, radius);
-        auto outIDs = outputMesh->index().getVerticesInsideBox(center, radius);
+        inIDs = inputMesh->index().getVerticesInsideBox(center, radius);
+        outIDs = outputMesh->index().getVerticesInsideBox(center, radius);
     }
 
     auto filterIDs = [&](mesh::Mesh::VertexOffsets& ids, mesh::PtrMesh mesh) {
@@ -199,7 +203,7 @@ AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
     _outputIDs.insert(outIDs.begin(), outIDs.end());
 
     // 5. Re-initialize RBF Solver with Transformed Data
-    std::vector<bool> deadAxis(inputMesh.getDimensions(), false);
+    std::vector<bool> deadAxis(inputMesh->getDimensions(), false);
     
     _rbfSolver = RadialBasisFctSolver<RADIAL_BASIS_FUNCTION_T>{
         function, 
@@ -388,6 +392,13 @@ double AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeWeight(const me
     return std::sqrt(d2);
 }
 
+// 基于_inIDs和_outIDs，计算归一化权重
+template <typename RADIAL_BASIS_FUNCTION_T>
+void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeNormalizedWeights()
+{
+
+}
+
 template <typename RADIAL_BASIS_FUNCTION_T>
 void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::setNormalizedWeight(double normalizedWeight, VertexID vertexID)
 {
@@ -401,11 +412,9 @@ void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::setNormalizedWeight(doub
     // The find method of boost flat_set comes with O(log(N)) complexity (the more expensive part here)
     auto localID = _outputIDs.index_of(_outputIDs.find(vertexID));
 
-    PRECICE_ASSERT(static_case<Eigen::Index>(localID) < _normalizedWeights.size(), localID, _normalizedWeights.size());
+    PRECICE_ASSERT(static_cast<Eigen::Index>(localID) < _normalizedWeights.size(), localID, _normalizedWeights.size());
     _normalizedWeights[localID] = normalizedWeight;
 }
-
-// @todo
 
 template <typename RADIAL_BASIS_FUNCTION_T>
 void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::evaluateConservativeCache(Eigen::MatrixXd &epsilon, const Eigen::MatrixXd &Au, Eigen::Ref<Eigen::MatrixXd> out)
