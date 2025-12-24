@@ -129,7 +129,8 @@ private:
   /// The mesh name is only required for logging purposes
   /// returns the clusterIDs and all weights for these clusters
   std::pair<std::vector<int>, std::vector<double>> computeNormalizedWeight(const mesh::Vertex &v, std::string_view mesh);
-
+  void computeNormalizedWeights(mesh::PtrMesh outMesh);
+  
   /// export the center vertices of all clusters as a mesh with some additional data on it such as vertex count
   /// only enabled in debug builds and mainly for debugging purpose
   void exportClusterCentersAsVTU(mesh::Mesh &centers);
@@ -214,21 +215,7 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeMapping()
   }
 
   precice::profiling::Event eWeights("map.pou.computeMapping.computeWeights");
-  // Log a bounding box of the center mesh
-  _centerMesh->computeBoundingBox();
-  PRECICE_DEBUG("Bounding Box of the anisotropic cluster centers {}", _centerMesh->getBoundingBox());
-
-  // Step 3: Determine PU weights
-  PRECICE_DEBUG("Computing cluster-vertex association");
-  for (const auto &vertex : outMesh->vertices()) {
-    // we use a helper function, as we need the same functionality for just-in-time mapping
-    auto [clusterIDs, normalizedWeights] = computeNormalizedWeight(vertex, outMesh->getName());
-    // Step 4: store the normalized weight in all associated clusters
-    for (unsigned int i = 0; i < clusterIDs.size(); ++i) {
-      PRECICE_ASSERT(clusterIDs[i] < static_cast<int>(_anisotropicClusters.size()));
-      _anisotropicClusters[clusterIDs[i]].setNormalizedWeight(normalizedWeights[i], vertex.getID());
-    }
-  }
+  computeNormalizedWeights(outMesh);
   eWeights.stop();
 
   // Uncomment to add a VTK export of the cluster center distribution for visualization purposes
@@ -243,22 +230,41 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeMapping()
 }
 
 template <typename RADIAL_BASIS_FUNCTION_T>
+void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeNormalizedWeights(mesh::PtrMesh outMesh)
+{
+  PRECICE_TRACE();
+
+  // 1-遍历所有簇，提取权重并加到全局权重表中
+  std::vector<double> globalWeights(outMesh->nVertices(), 0.0);
+  for (const auto &cluster : _anisotropicClusters) {
+    const auto &localWeights = cluster.getWeights();
+    const auto &outputIDs    = cluster.getOutputIDs();
+    for (unsigned int i = 0; i < outputIDs.size(); ++i) {
+      const double w = localWeights[i];
+      globalWeights[*(outputIDs.nth(i))] += w;
+    }
+  }
+
+  // 2-遍历所有簇，将权重除以全局权重表中对应项，得到归一化权重并存储回簇中
+  for (auto &cluster : _anisotropicClusters) {
+    const auto &localWeights = cluster.getWeights();
+    const auto &outputIDs    = cluster.getOutputIDs();
+    for (unsigned int i = 0; i < outputIDs.size(); ++i) {
+      const double normalizedWeight = localWeights[i] / globalWeights[*(outputIDs.nth(i))];
+      cluster.setNormalizedWeight(normalizedWeight, *(outputIDs.nth(i)));
+    }
+  }
+}
+
+template <typename RADIAL_BASIS_FUNCTION_T>
 std::pair<std::vector<int>, std::vector<double>> PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeNormalizedWeight(const mesh::Vertex &vertex, std::string_view mesh)
 {
+  std::vector<VertexID> clusterIDs;
 
-  // Step 1: index the clusters / the center mesh in order to define the output vertex -> cluster ownership
-  // the ownership is required to compute the normalized partition of unity weights (Step 2)
-  // query::Index clusterIndex(*_centerMesh.get());
-  PRECICE_ASSERT(_centerMesh);
-  query::Index &clusterIndex = _centerMesh->index();
-
-  // Step 2: find all clusters the output vertex lies in, i.e., find all cluster centers which have the distance of a cluster radius from the given output vertex
-  // Here, we do this using the RTree on the centerMesh: VertexID (queried from the centersMesh) == clusterID, by construction above. The loop uses
-  // the vertices to compute the weights required for the partition of unity data mapping.
-  // Note: this could also be done on-the-fly in the map data phase for dynamic queries, which would require to make the mesh as well as the indexTree member variables.
-
-  // Step 2a: get the relevant clusters for the output vertex
-  auto       clusterIDs            = clusterIndex.getVerticesInsideBox(vertex, _clusterRadius);
+  for (unsigned int i = 0; i < _anisotropicClusters.size(); ++i) {
+    if (_anisotropicClusters[i].isCovering(vertex.getCoords()))
+      clusterIDs.push_back(i);
+  }
   const auto localNumberOfClusters = clusterIDs.size();
 
   // Consider the case where we didn't find any cluster (meshes don't match very well)

@@ -58,9 +58,6 @@ public:
     /// Evaluates a consistent mapping and agglomerates the result in the given output data
     void mapConsistent(const time::Sample &inData, Eigen::VectorXd &outData) const;
     
-    /// Compute the weight for a given vertex
-    double computeWeight(const mesh::Vertex &v) const;
-    
     /// Number of input vertices this partition operates on
     unsigned int getNumberOfInputVertices() const;
 
@@ -92,7 +89,13 @@ public:
 
     // ------------------------------- Others ----------------------------
 
-    void computeNormalizedWeights();
+    double computeWeight(const mesh::Vertex &v) const;
+
+    void computeWeights(mesh::PtrMesh outMesh);
+
+    Eigen::VectorXd getWeights() const;
+
+    boost::container::flat_set<VertexID> getOutputIDs() const;
 
     // 判断顶点是否在椭球覆盖范围内，判据: (x-c)^T * M * (x-c) <= 1.0
     bool isCovering(const Eigen::Vector3d& vertex) const;
@@ -155,8 +158,8 @@ AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
     double radius,
     RADIAL_BASIS_FUNCTION_T function,
     Polynomial polynomial,
-    mesh::PtrMesh inputMesh,
-    mesh::PtrMesh outputMesh,
+    mesh::PtrMesh inMesh,
+    mesh::PtrMesh outMesh,
     const PilotPoint& pilot, 
     double shapeParameter
 ) : _pilotID(pilot.id), _center(center), _radius(radius), _polynomial(polynomial), _function(function)
@@ -171,11 +174,11 @@ AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
     mesh::Mesh::VertexOffsets inIDs, outIDs;
 
     if (pilot.type == FeatureType::LINEAR) {
-        inIDs = inputMesh->index().getVerticesInsideBox(center, radius * shapeParameter);
-        outIDs = outputMesh->index().getVerticesInsideBox(center, radius * shapeParameter);
+        inIDs = inMesh->index().getVerticesInsideBox(center, radius * shapeParameter);
+        outIDs = outMesh->index().getVerticesInsideBox(center, radius * shapeParameter);
     } else {
-        inIDs = inputMesh->index().getVerticesInsideBox(center, radius);
-        outIDs = outputMesh->index().getVerticesInsideBox(center, radius);
+        inIDs = inMesh->index().getVerticesInsideBox(center, radius);
+        outIDs = outMesh->index().getVerticesInsideBox(center, radius);
     }
 
     auto filterIDs = [&](mesh::Mesh::VertexOffsets& ids, mesh::PtrMesh mesh) {
@@ -196,20 +199,22 @@ AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
         }
     };
     // Access protected members from SphericalVertexCluster
-    filterIDs(inIDs, inputMesh);
-    filterIDs(outIDs, outputMesh);
+    filterIDs(inIDs, inMesh);
+    filterIDs(outIDs, outMesh);
 
     _inputIDs.insert(inIDs.begin(), inIDs.end());
     _outputIDs.insert(outIDs.begin(), outIDs.end());
 
+    computeWeights(outMesh);
+
     // 5. Re-initialize RBF Solver with Transformed Data
-    std::vector<bool> deadAxis(inputMesh->getDimensions(), false);
+    std::vector<bool> deadAxis(inMesh->getDimensions(), false);
     
     _rbfSolver = RadialBasisFctSolver<RADIAL_BASIS_FUNCTION_T>{
         function, 
-        *inputMesh.get(), 
+        *inMesh.get(), 
         _inputIDs, 
-        *outputMesh.get(), 
+        *outMesh.get(), 
         _outputIDs, 
         deadAxis, 
         _polynomial
@@ -377,26 +382,54 @@ double AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeWeight(const me
 {
     auto c = getCenterCoords();
     Eigen::Vector3d center(c[0], c[1], c[2]);
-    
-    auto rv = v.rawCoords();
-    Eigen::Vector3d pv(rv[0], rv[1], rv[2]);
-    
-    Eigen::Vector3d diff = pv - center;
-    
+
+    Eigen::Vector3d vertex = v.getCoords();
+
+    Eigen::Vector3d diff = vertex - center;
     const double d2 = diff.transpose() * _inverseCovariance * diff;
-    
+
     if (d2 > 1.0 + math::NUMERICAL_ZERO_DIFFERENCE) {
         return 0.0;
+    } else {
+        return std::sqrt(d2);
     }
-    
-    return std::sqrt(d2);
 }
 
-// 基于_inIDs和_outIDs，计算归一化权重
 template <typename RADIAL_BASIS_FUNCTION_T>
-void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeNormalizedWeights()
-{
+void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeWeights(mesh::PtrMesh outMesh)
+{   
+    auto c = getCenterCoords();
+    Eigen::Vector3d center(c[0], c[1], c[2]);
 
+    for (std::size_t i = 0; i < _outputIDs.size(); ++i) {
+        const auto dataIndex = *(_outputIDs.nth(i));
+        PRECICE_ASSERT(dataIndex < _outputIDs.size(), dataIndex, _outputIDs.size());
+
+        auto outVertex = outMesh->vertex(dataIndex);
+        auto outVertexCoords = outVertex.rawCoords();
+        Eigen::Vector3d outVextor(outVertexCoords[0], outVertexCoords[1], outVertexCoords[2]);
+        Eigen::Vector3d diff = outVextor - center;
+
+        const double d2 = diff.transpose() * _inverseCovariance * diff;
+
+        if (d2 > 1.0 + math::NUMERICAL_ZERO_DIFFERENCE) {
+            setNormalizedWeight(0.0, dataIndex);
+        } else {
+            setNormalizedWeight(std::sqrt(d2), dataIndex);
+        }
+    }
+}
+
+template <typename RADIAL_BASIS_FUNCTION_T>
+Eigen::VectorXd AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::getWeights() const
+{
+    return _normalizedWeights;
+}
+
+template <typename RADIAL_BASIS_FUNCTION_T>
+boost::container::flat_set<VertexID> AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::getOutputIDs() const
+{
+    return _outputIDs;
 }
 
 template <typename RADIAL_BASIS_FUNCTION_T>
