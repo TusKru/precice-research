@@ -144,7 +144,7 @@ std::vector<PilotPoint> computePilotPoints(const mesh::PtrMesh inMesh)
  * @return std::vector<AnisotropicVertexCluster> 生成的簇列表
  */
 template <typename RADIAL_BASIS_FUNCTION_T>
-std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>> createAnisotropicClustering(const mesh::PtrMesh inMesh,const mesh::PtrMesh outMesh,  RADIAL_BASIS_FUNCTION_T function, Polynomial polynomial, unsigned int targetVerticesPerCluster) 
+std::tuple<std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>>, double> createAnisotropicClustering(const mesh::PtrMesh inMesh,const mesh::PtrMesh outMesh,  RADIAL_BASIS_FUNCTION_T function, Polynomial polynomial, unsigned int targetVerticesPerCluster) 
 {
     unsigned int mcSampleCount = 10;
     double shapeParameter = 3.0;
@@ -152,7 +152,7 @@ std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>> createAnisotropic
     // 1. 准备数据结构
     std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>> clusters;
     int vertexCount = inMesh->vertices().size();
-    if (vertexCount == 0) return clusters;
+    if (vertexCount == 0) return {clusters, 0.0};
 
     // vector<bool>标记覆盖状态
     std::vector<bool> isCovered(vertexCount, false);
@@ -182,6 +182,8 @@ std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>> createAnisotropic
     // 终止条件可设为覆盖率达99%或连续多次无法找到有效新簇
     int maxFailures = 100;
     int failures = 0;
+
+    double maxRange = 0.0;
 
     while (coveredCount < vertexCount) {
         // --- 步骤 A: 蒙特卡洛优化的 FPS 采样 (注意事项1) ---
@@ -258,10 +260,12 @@ std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>> createAnisotropic
         // --- 步骤 E: 更新覆盖状态 ---
         // 粗筛：利用 R-Tree 找新簇包围盒内的点
         // 精筛：用 Mahalanobis 距离判断
+        double searchRadius;
+        mesh::Mesh::VertexOffsets candidateIndices;
         if (nearestPilot.type == FeatureType::LINEAR) {
             // 面状为基础半径再压扁，体状为基础半径的圆球，因此最大搜索半径均为基础半径
-            double searchRadius = baseRadius * shapeParameter;
-            auto candidateIndices = inputIndex.getClosestVertices(newCenterPos, searchRadius);
+            searchRadius = baseRadius * shapeParameter;
+            candidateIndices = inputIndex.getClosestVertices(newCenterPos, searchRadius);
 
             for (int idx : candidateIndices) {
                 if (isCovered[idx]) continue;
@@ -273,8 +277,8 @@ std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>> createAnisotropic
             }
         } else if (nearestPilot.type == FeatureType::SURFACE) {
             // 面状为基础半径再压扁，体状为基础半径的圆球，因此最大搜索半径均为基础半径
-            double searchRadius = baseRadius;
-            auto candidateIndices = inputIndex.getClosestVertices(newCenterPos, searchRadius);
+            searchRadius = baseRadius;
+            candidateIndices = inputIndex.getClosestVertices(newCenterPos, searchRadius);
 
             for (int idx : candidateIndices) {
                 if (isCovered[idx]) continue;
@@ -285,8 +289,8 @@ std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>> createAnisotropic
                 }
             }
         } else if (nearestPilot.type == FeatureType::VOLUMETRIC) {
-            double searchRadius = baseRadius;
-            auto candidateIndices = inputIndex.getClosestVertices(newCenterPos, searchRadius);
+            searchRadius = baseRadius;
+            candidateIndices = inputIndex.getClosestVertices(newCenterPos, searchRadius);
 
             for (int idx : candidateIndices) {
                 if (isCovered[idx]) continue;
@@ -295,9 +299,11 @@ std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>> createAnisotropic
                 coveredCount++;
             }
         }
+        maxRange = std::max(maxRange, searchRadius);
+
     }
 
-    return clusters;
+    return {clusters, maxRange};
 }
 
 } // namespace precice::mapping::impl
