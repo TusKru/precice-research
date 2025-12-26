@@ -14,29 +14,11 @@
 
 namespace precice::mapping {
 
-using Vertices = std::vector<mesh::Vertex>;
-
-// 导引点所属的局部特征类型，对应第一步"网格局部特征识别"的产出
-enum class FeatureType {
-    LINEAR,     // 线状 (Prolate)
-    SURFACE,    // 面状 (Oblate)
-    VOLUMETRIC  // 体状 (Sphere)
-};
-
-/**
- * @brief Storage the geometric feature.
- * @param position the physical coordinates of the feature(the position of the guide point)
- * @param eigenvalues the eigenvalues(lamda1-3) after PCA decomposition, used to determine the feature type
- * @param eigenvectors the eigenvector matrix(principal directions), 
- *        used to determine the rotational pose of the anisotropic ellipsoid
- * @param type the type of the feature, with enumeration options:{LINEAR, SURFACE, VOLUMETRIC}
-*/
-struct PilotPoint {
-    Eigen::Vector3d position;
-    FeatureType type;
-    Eigen::Vector3d eigenvalues;  // lambda1 >= lambda2 >= lambda3
-    Eigen::Matrix3d eigenvectors; // 列向量 v1, v2, v3
-    int id;
+struct GlobalAnisotropyParams {
+  Eigen::Matrix3d rotation;
+  Eigen::Vector3d semiAxes;
+  Eigen::Matrix3d inverseCovariance;
+  double coverSearchRadius;
 };
 
 template <typename RADIAL_BASIS_FUNCTION_T>
@@ -44,13 +26,11 @@ class AnisotropicVertexCluster {
 public:
     AnisotropicVertexCluster(
         mesh::Vertex center, 
-        double radius,
         RADIAL_BASIS_FUNCTION_T function,
         Polynomial polynomial,
         mesh::PtrMesh inputMesh,
         mesh::PtrMesh outputMesh,
-        const PilotPoint& pilot, 
-        double shapeParameter = 3.0);
+        const GlobalAnisotropyParams& params);
 
     /// Evaluates a conservative mapping and agglomerates the result in the given output data
     void mapConservative(const time::Sample &inData, Eigen::VectorXd &outData) const;
@@ -89,28 +69,23 @@ public:
 
     // ------------------------------- Others ----------------------------
 
-    double computeWeight(const mesh::Vertex &v) const;
+    double computeD2(const mesh::Vertex &v) const;
 
-    void computeWeights(mesh::PtrMesh outMesh);
+    double computeWeight(const mesh::Vertex &v) const;
 
     Eigen::VectorXd getWeights() const;
 
     boost::container::flat_set<VertexID> getOutputIDs() const;
 
     // 判断顶点是否在椭球覆盖范围内，判据: (x-c)^T * M * (x-c) <= 1.0
-    bool isCovering(const Eigen::Vector3d& vertex) const;
-
-    void computeShapeMatrix(const PilotPoint& pilot, double r, double alpha);
+    bool isCovering(const mesh::Vertex &v) const;
 
 private:
     /// logger, as usual
-    mutable precice::logging::Logger _log{"mapping::SphericalVertexCluster"};
+    mutable precice::logging::Logger _log{"mapping::AnisotropicVertexCluster"};
 
     /// center vertex of the cluster
     mesh::Vertex _center;
-
-    /// radius of the vertex cluster
-    const double _radius;
 
     /// The RBF solver
     RadialBasisFctSolver<RADIAL_BASIS_FUNCTION_T> _rbfSolver;
@@ -140,14 +115,8 @@ private:
 
     // ------------------------------- Others ----------------------------
     
-    int _pilotID;
-
     // 运行时缓存的逆协方差矩阵，用于快速判断覆盖 (Mahalanobis distance)
     Eigen::Matrix3d _inverseCovariance;
-
-    // Transformation components for mapping to unit sphere
-    Eigen::Matrix3d _rotation; // Eigenvectors
-    Eigen::Vector3d _inverseSemiAxes; // 1/semiAxes
 };
 
 // --------------------------------------------------- HEADER IMPLEMENTATIONS
@@ -155,59 +124,41 @@ private:
 template <typename RADIAL_BASIS_FUNCTION_T>
 AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
     mesh::Vertex center, 
-    double radius,
     RADIAL_BASIS_FUNCTION_T function,
     Polynomial polynomial,
     mesh::PtrMesh inMesh,
     mesh::PtrMesh outMesh,
-    const PilotPoint& pilot, 
-    double shapeParameter
-) : _pilotID(pilot.id), _center(center), _radius(radius), _polynomial(polynomial), _function(function)
+    const GlobalAnisotropyParams& params
+) : _center(center), _polynomial(polynomial), _function(function), _inverseCovariance(params.inverseCovariance)
 {
-    // 1. Compute Shape Matrix and Transformation components
-    PRECICE_ASSERT(radius > 0, "r must be positive");
-    PRECICE_ASSERT(shapeParameter > 1, "shapeParameter must be greater than 1");
-    computeShapeMatrix(pilot, radius, shapeParameter);
+    // 1. Identify input and output vertex IDs within the anisotropic ellipsoidal region
+    // Coarse filter: get vertices inside the bounding box defined by coverSearchRadius
+    auto inIDs = inMesh->index().getVerticesInsideBox(center, params.coverSearchRadius);
+    auto outIDs = outMesh->index().getVerticesInsideBox(center, params.coverSearchRadius);
 
-    // 2. Identify input and output vertex IDs within the anisotropic ellipsoidal region
-    // We first get candidates within a bounding sphere, then filter based on Mahalanobis distance
-    mesh::Mesh::VertexOffsets inIDs, outIDs;
-
-    if (pilot.type == FeatureType::LINEAR) {
-        inIDs = inMesh->index().getVerticesInsideBox(center, radius * shapeParameter);
-        outIDs = outMesh->index().getVerticesInsideBox(center, radius * shapeParameter);
-    } else {
-        inIDs = inMesh->index().getVerticesInsideBox(center, radius);
-        outIDs = outMesh->index().getVerticesInsideBox(center, radius);
-    }
-
+    // Fine filter: check isCovering
     auto filterIDs = [&](mesh::Mesh::VertexOffsets& ids, mesh::PtrMesh mesh) {
         for (auto it = ids.begin(); it != ids.end(); ) {
-            const auto& v = mesh->vertex(*it);
-            Eigen::Vector3d vPos;
-            if (v.getDimensions() == 3) {
-                vPos << v.coord(0), v.coord(1), v.coord(2);
-            } else {
-                vPos << v.coord(0), v.coord(1), 0.0;
-            }
-
-            if (!isCovering(vPos)) {
+            if (!isCovering(mesh->vertex(*it))) {
                 it = ids.erase(it);
             } else {
                 ++it;
             }
         }
     };
-    // Access protected members from SphericalVertexCluster
+    
     filterIDs(inIDs, inMesh);
     filterIDs(outIDs, outMesh);
 
     _inputIDs.insert(inIDs.begin(), inIDs.end());
     _outputIDs.insert(outIDs.begin(), outIDs.end());
 
-    computeWeights(outMesh);
+    // 2. If the cluster is empty, we return immediately
+    if (empty()) {
+        return;
+    }
 
-    // 5. Re-initialize RBF Solver with Transformed Data
+    // 3. Re-initialize RBF Solver
     std::vector<bool> deadAxis(inMesh->getDimensions(), false);
     
     _rbfSolver = RadialBasisFctSolver<RADIAL_BASIS_FUNCTION_T>{
@@ -303,50 +254,9 @@ void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::mapConsistent(const time
 }
 
 template <typename RADIAL_BASIS_FUNCTION_T>
-bool AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::isCovering(const Eigen::Vector3d& vertex) const 
+bool AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::isCovering(const mesh::Vertex &v) const 
 {
-    auto c = this->getCenterCoords();
-    Eigen::Vector3d center(c[0], c[1], c[2]);
-    Eigen::Vector3d diff = vertex - center;
-    return (diff.transpose() * _inverseCovariance * diff).value() <= 1.0;
-}
-
-template <typename RADIAL_BASIS_FUNCTION_T>
-void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeShapeMatrix(const PilotPoint& pilot, double r, double alpha) 
-{
-    // r: 基础半径 (由k近邻距离决定)
-    // alpha: 经验缩放系数
-    
-    Eigen::Vector3d semiAxes;
-    _rotation = pilot.eigenvectors; // v1, v2, v3
-
-    switch (pilot.type) {
-        case FeatureType::VOLUMETRIC: // 圆球
-            semiAxes = Eigen::Vector3d(r, r, r);
-            _rotation = Eigen::Matrix3d::Identity(); // 无方向
-            break;
-
-        case FeatureType::LINEAR: // 长球 (Prolate)
-            // 长轴(v1)放大，短轴(v2, v3)为基础半径
-            semiAxes = Eigen::Vector3d(r * alpha, r, r);
-            break;
-
-        case FeatureType::SURFACE: // 扁球 (Oblate)
-            // 法向v3压缩，切向v1/v2保持
-            semiAxes = Eigen::Vector3d(r, r, r / alpha); 
-            break;
-    }
-
-    _inverseSemiAxes << 1.0/semiAxes[0], 1.0/semiAxes[1], 1.0/semiAxes[2];
-
-    // M = R * S^(-2) * R^T
-    Eigen::Matrix3d S_inv2 = Eigen::Matrix3d::Zero();
-    S_inv2(0, 0) = _inverseSemiAxes[0] * _inverseSemiAxes[0];
-    S_inv2(1, 1) = _inverseSemiAxes[1] * _inverseSemiAxes[1];
-    S_inv2(2, 2) = _inverseSemiAxes[2] * _inverseSemiAxes[2];
-
-    // d^2 = x^T M x
-    _inverseCovariance = _rotation * S_inv2 * _rotation.transpose();
+    return computeD2(v) <= 1.0;
 }
 
 template <typename RADIAL_BASIS_FUNCTION_T>
@@ -378,45 +288,35 @@ unsigned int AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::getNumberOfInput
 }
 
 template <typename RADIAL_BASIS_FUNCTION_T>
-double AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeWeight(const mesh::Vertex &v) const
+double AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeD2(const mesh::Vertex &v) const
 {
     auto c = getCenterCoords();
     Eigen::Vector3d center(c[0], c[1], c[2]);
 
-    Eigen::Vector3d vertex = v.getCoords();
-
-    Eigen::Vector3d diff = vertex - center;
-    const double d2 = diff.transpose() * _inverseCovariance * diff;
-
-    if (d2 > 1.0 + math::NUMERICAL_ZERO_DIFFERENCE) {
-        return 0.0;
+    Eigen::Vector3d vPos;
+    if (v.getDimensions() == 3) {
+        vPos = v.getCoords();
     } else {
-        return std::sqrt(d2);
+        vPos << v.coord(0), v.coord(1), 0.0;
     }
+
+    Eigen::Vector3d diff = vPos - center;
+    return diff.transpose() * _inverseCovariance * diff;
 }
 
 template <typename RADIAL_BASIS_FUNCTION_T>
-void AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeWeights(mesh::PtrMesh outMesh)
-{   
-    auto c = getCenterCoords();
-    Eigen::Vector3d center(c[0], c[1], c[2]);
+double AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeWeight(const mesh::Vertex &v) const
+{
+    const double d2 = computeD2(v);
 
-    for (std::size_t i = 0; i < _outputIDs.size(); ++i) {
-        const auto dataIndex = *(_outputIDs.nth(i));
-        PRECICE_ASSERT(dataIndex < _outputIDs.size(), dataIndex, _outputIDs.size());
-
-        auto outVertex = outMesh->vertex(dataIndex);
-        auto outVertexCoords = outVertex.rawCoords();
-        Eigen::Vector3d outVextor(outVertexCoords[0], outVertexCoords[1], outVertexCoords[2]);
-        Eigen::Vector3d diff = outVextor - center;
-
-        const double d2 = diff.transpose() * _inverseCovariance * diff;
-
-        if (d2 > 1.0 + math::NUMERICAL_ZERO_DIFFERENCE) {
-            setNormalizedWeight(0.0, dataIndex);
-        } else {
-            setNormalizedWeight(std::sqrt(d2), dataIndex);
-        }
+    if (d2 > 1.0) {
+        return 0.0;
+    } else {
+        // Use CompactPolynomialC2 to ensure monotonic decrease and 0 boundary
+        // Formula: (1 - u)^4 * (4u + 1) where u = sqrt(d2)
+        // Since we normalized boundary to 1.0, we use supportRadius = 1.0
+        static CompactPolynomialC2 weighting(1.0);
+        return weighting.evaluate(std::sqrt(d2));
     }
 }
 

@@ -4,6 +4,9 @@
 #include <random>
 #include <algorithm>
 #include <cmath>
+#include <Eigen/Core>
+#include <Eigen/Eigenvalues>
+#include <Eigen/Geometry>
 
 #include "mesh/Mesh.hpp"
 #include "query/Index.hpp"
@@ -11,29 +14,26 @@
 #include "precice/impl/Types.hpp"
 #include "mapping/RadialBasisFctSolver.hpp"
 
-namespace precice::mapping {
+#include "mapping/impl/CreateClustering.hpp" 
+
+namespace precice::mapping::impl {
 
 namespace {
 
 /**
- * @brief Voxel Downsampling(2D: split in 4 parts; 3D: split in 8 parts)
- * 
- * @param[in] inMesh input mesh(source mesh) for creating guide points
- * 
- * @return a collection of pilot points(mesh::Vertex) using for geometric feature computation
-*/
-Vertices samplePilotPositions(const mesh::PtrMesh inMesh)
+ * @brief Voxel Downsampling to get pilot points
+ */
+std::vector<Eigen::Vector3d> samplePilotPositions(const mesh::PtrMesh inMesh)
 {
     precice::mesh::BoundingBox bb = inMesh->index().getRtreeBounds();
 
     PRECICE_ASSERT(!bb.isDefault(), "Invalid bounding box.");
-    const auto bbCenter = bb.center();
-
+    
     const int dim = inMesh->getDimensions();
-    PRECICE_ASSERT(dim == 2 || dim == 3, "Dimension {} not supported for pilot point sampling.", dim);
-
-    // Step 1: create voxel grid        
-    int nSplits = 2; // split each dimension in 2 parts
+    // Use a fixed split or adaptive? 2 splits per dim = 4 or 8 points. Might be too few for global stats.
+    // Let's increase to 4 splits per dim -> 64 points in 3D. Better for statistics.
+    int nSplits = 4; 
+    
     std::vector<double> distances(dim);
     std::vector<double> start(dim);
     for (int d = 0; d < dim; ++d) {
@@ -41,15 +41,15 @@ Vertices samplePilotPositions(const mesh::PtrMesh inMesh)
         start[d] = bb.minCorner()[d] + distances[d] / 2.0;
     }
 
-    Vertices pilotPositions;
+    std::vector<Eigen::Vector3d> pilotPositions;
     std::vector<double> centerCoords(dim);
-    // Fill the centers
+    
     if (dim == 2) {
         for (int i = 0; i < nSplits; ++i) {
             for (int j = 0; j < nSplits; ++j) {
                 centerCoords[0] = start[0] + i * distances[0];
                 centerCoords[1] = start[1] + j * distances[1];
-                pilotPositions.emplace_back(mesh::Vertex({centerCoords, static_cast<VertexID>(pilotPositions.size())}));
+                pilotPositions.emplace_back(Eigen::Vector3d(centerCoords[0], centerCoords[1], 0.0));
             }
         }
     } else if (dim == 3) {
@@ -59,251 +59,231 @@ Vertices samplePilotPositions(const mesh::PtrMesh inMesh)
                     centerCoords[0] = start[0] + i * distances[0];
                     centerCoords[1] = start[1] + j * distances[1];
                     centerCoords[2] = start[2] + k * distances[2];
-                    pilotPositions.emplace_back(mesh::Vertex({centerCoords, static_cast<VertexID>(pilotPositions.size())}));
+                    pilotPositions.emplace_back(Eigen::Vector3d(centerCoords[0], centerCoords[1], centerCoords[2]));
                 }
             }
         }
     }
     return pilotPositions;
 }
+/**
+ * @brief Compute global anisotropy parameters based on pilot positions in the input mesh.
+ *        Uses PCA to determine the main directions and their variances.
+ * 
+ * @param[in] inMesh The input mesh.
+ * @param[in] baseRadius The base radius for the smallest semi-axis.
+ * @param[in] kNeighbors Number of neighbors to consider for local covariance.
+ * 
+ * @return GlobalAnisotropyParams The computed global anisotropy parameters.
+ */
+GlobalAnisotropyParams computeGlobalAnisotropyParams(
+    const mesh::PtrMesh inMesh,
+    double baseRadius,
+    const unsigned int kNeighbors = 20)
+{
+    GlobalAnisotropyParams params;
+    Eigen::Matrix3d globalCov = Eigen::Matrix3d::Zero();
+    int validPilots = 0;
+
+    std::vector<Eigen::Vector3d> pilotPositions = samplePilotPositions(inMesh);
+    
+    // PCA over pilot positions
+    for(const auto& p : pilotPositions) {
+        auto neighbors = inMesh->index().getClosestVertices(p, kNeighbors);
+        if(neighbors.size() < 4) continue; // Need at least 4 points for 3D covariance
+        
+        Eigen::MatrixXd data(neighbors.size(), 3);
+        for(size_t i = 0; i < neighbors.size(); ++i) {
+            const auto& v = inMesh->vertex(neighbors[i]);
+            if(v.getDimensions() == 3) 
+                data.row(i) = v.getCoords();
+            else 
+                data.row(i) << v.coord(0), v.coord(1), 0.0;
+        }
+        
+        Eigen::Vector3d mean = data.colwise().mean();
+        Eigen::MatrixXd centered = data.rowwise() - mean.transpose();
+        Eigen::Matrix3d cov = (centered.adjoint() * centered) / double(data.rows() - 1);
+        
+        globalCov += cov;
+        validPilots++;
+    }
+    
+    if(validPilots > 0) 
+        globalCov /= validPilots;
+    else 
+        globalCov = Eigen::Matrix3d::Identity(); // Fallback
+    
+    // Eigen Decomposition
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigSolver(globalCov);
+    Eigen::Vector3d eigenvalues = eigSolver.eigenvalues(); // Sorted ascending
+    Eigen::Matrix3d eigenvectors = eigSolver.eigenvectors();
+    
+    // Ensure eigenvalues are positive
+    eigenvalues = eigenvalues.cwiseMax(1e-10);
+    
+    // Reverse to descending (lambda1 >= lambda2 >= lambda3)
+    Eigen::Vector3d lambda;
+    lambda << eigenvalues(2), eigenvalues(1), eigenvalues(0);
+    Eigen::Matrix3d R;
+    R << eigenvectors.col(2), eigenvectors.col(1), eigenvectors.col(0);
+    
+    params.rotation = R;
+    
+    // Determine semi-axes based on aspect ratio
+    // Smallest axis = baseRadius.
+    // axis_i = baseRadius * sqrt(lambda_i) / sqrt(lambda_min)
+    // lambda_min is lambda(2)
+    double min_sqrt_lambda = std::sqrt(lambda(2));
+    
+    params.semiAxes(0) = baseRadius * std::sqrt(lambda(0)) / min_sqrt_lambda;
+    params.semiAxes(1) = baseRadius * std::sqrt(lambda(1)) / min_sqrt_lambda;
+    params.semiAxes(2) = baseRadius;
+    
+    params.coverSearchRadius = params.semiAxes.maxCoeff();
+    
+    // Precompute Inverse Covariance: M = R * S^-2 * R^T
+    Eigen::Matrix3d S_inv2 = Eigen::Matrix3d::Zero();
+    S_inv2(0, 0) = 1.0 / (params.semiAxes(0) * params.semiAxes(0));
+    S_inv2(1, 1) = 1.0 / (params.semiAxes(1) * params.semiAxes(1));
+    S_inv2(2, 2) = 1.0 / (params.semiAxes(2) * params.semiAxes(2));
+    
+    params.inverseCovariance = R * S_inv2 * R.transpose();
+
+    return params;
+}
 
 /**
- * @brief 自适应各向异性映射的网格局部特征识别 (研究点一·步骤一)
+ * @brief Generate a local anisotropic cluster centers within the given bounds with the given radii and overlap.
+ *        Cluster centers are generated in a Hexagonal Close Packing like structure for better packing.
  * 
- * @param[in] inMesh the mesh we search for the k-nearest vertices around each pilot point
- * 
- * @return a collection of LocalFeature structs representing the geometric features
+ * @param[in] local_bounds The local bounding box (min, max) for cluster center generation.
+ * @param[in] radii The base radii of the local cluster.
+ * @param[in] overlap The overlap of the local cluster.
+ * @return std::vector<Eigen::Vector3d> The points of the local lattice.
  */
-std::vector<PilotPoint> computePilotPoints(const mesh::PtrMesh inMesh)
+std::vector<Eigen::Vector3d> generateLocalClusterCenters(
+    const std::pair<Eigen::Vector3d, Eigen::Vector3d>& local_bounds,
+    const Eigen::Vector3d& radii,
+    double overlap)
 {
-    std::vector<PilotPoint> pilotPoints;
-    const int kNearest = 20; // number of nearest neighbors to consider for PCA
+    std::vector<Eigen::Vector3d> points;
+    Eigen::Vector3d step = 2.0 * radii * 0.5;// (1.0 - overlap);
+    
+    if(step.minCoeff() <= 1e-9) return points;
 
-    Vertices pilotPositions = samplePilotPositions(inMesh);
+    const auto& min = local_bounds.first;
+    const auto& max = local_bounds.second;
 
-    for (const auto &pilotPosition : pilotPositions) {
-        // Step 1: find k-nearest neighbors
-        auto neighborIDs = inMesh->index().getClosestVertices(pilotPosition.getCoords(), kNearest);
-        PRECICE_ASSERT(!neighborIDs.empty(), "No neighbors found for pilot point ID {}.", pilotPosition.getID());
+    int nz = static_cast<int>(std::ceil((max.z() - min.z()) / step.z()));
+    int ny = static_cast<int>(std::ceil((max.y() - min.y()) / step.y()));
+    int nx = static_cast<int>(std::ceil((max.x() - min.x()) / step.x()));
+    
+    // Add buffer
+    nz += 2; ny += 2; nx += 2;
+    
+    // Start a bit before min to cover edges after rotation/shifting
+    double start_z = min.z() - step.z();
+    double start_y = min.y() - step.y();
+    double start_x = min.x() - step.x();
 
-        // Step 2: assemble data matrix
-        Eigen::MatrixXd data(neighborIDs.size(), inMesh->getDimensions());
-        for (size_t i = 0; i < neighborIDs.size(); ++i) {
-            auto coords = inMesh->vertex(neighborIDs[i]).getCoords();
-            for (int d = 0; d < inMesh->getDimensions(); ++d) {
-                data(i, d) = coords[d];
+    for (int k = 0; k < nz; ++k) {
+        double z = start_z + k * step.z();
+        
+        // Offset for layer k
+        // FCC-like: Layer 0 at (0,0), Layer 1 at (0.5, 0.5)
+        double layer_offset_y = (k % 2 != 0) ? step.y() * 0.5 : 0.0;
+        double layer_offset_x = (k % 2 != 0) ? step.x() * 0.5 : 0.0;
+
+        for (int j = 0; j < ny; ++j) {
+            double y = start_y + j * step.y() + layer_offset_y;
+            
+            // Staggered rows: Row j+1 offset by 0.5 X
+            double row_offset_x = (j % 2 != 0) ? step.x() * 0.5 : 0.0;
+            
+            double total_offset_x = layer_offset_x + row_offset_x;
+            // normalize offset to be within [0, step.x)
+            while(total_offset_x >= step.x()) total_offset_x -= step.x();
+
+            for (int i = 0; i < nx; ++i) {
+                double x = start_x + i * step.x() + total_offset_x;
+                points.emplace_back(x, y, z);
             }
         }
-
-        // Step 3: perform PCA
-        Eigen::VectorXd mean = data.colwise().mean();
-        Eigen::MatrixXd centered = data.rowwise() - mean.transpose();
-        Eigen::MatrixXd cov = (centered.adjoint() * centered) / double(data.rows() - 1);
-        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigSolver(cov);
-        PRECICE_ASSERT(eigSolver.info() == Eigen::Success, "PCA Eigen decomposition failed for pilot point ID {}.", pilotPosition.getID());
-        Eigen::VectorXd eigenvalues = eigSolver.eigenvalues().reverse();
-        Eigen::MatrixXd eigenvectors = eigSolver.eigenvectors().rowwise().reverse();
-
-        // Step 4: determine feature type
-        FeatureType featureType;
-        if (inMesh->getDimensions() == 3) {
-            if (eigenvalues(1) / eigenvalues(0) < 0.1 && eigenvalues(2) / eigenvalues(0) < 0.1) {
-                featureType = FeatureType::LINEAR;
-            } else if (eigenvalues(2) / eigenvalues(1) < 0.1) {
-                featureType = FeatureType::SURFACE;
-            } else {
-                featureType = FeatureType::VOLUMETRIC;
-            }
-        } else { // 2D case
-            if (eigenvalues(1) / eigenvalues(0) < 0.1) {
-                featureType = FeatureType::LINEAR;
-            } else {
-                featureType = FeatureType::VOLUMETRIC;
-            }
-        }
-
-        // Step 5: store the feature
-        PilotPoint pilotPoint;
-        pilotPoint.position = mean.head<3>();
-        pilotPoint.eigenvalues = eigenvalues.head<3>();
-        pilotPoint.eigenvectors = eigenvectors.leftCols(3);
-        pilotPoint.type = featureType;
-        pilotPoints.push_back(pilotPoint);
     }
-    return pilotPoints;
+    return points;
 }
+
 } // namespace
 
 /**
- * @brief 生成各向异性簇 (研究点一·步骤二)
- * 
- * @param[in] inputMesh 待覆盖的网格 (Source Mesh)
- * @param[in] pilotPoints 第一步生成的导引点集
- * @param[in] targetVerticesPerCluster 目标顶点数/cluster (用于计算基础半径)
- * 
- * @return std::vector<AnisotropicVertexCluster> 生成的簇列表
+ * @brief Generate global anisotropic params and create Anisotropic Clustering with Global Params
  */
-template <typename RADIAL_BASIS_FUNCTION_T>
-std::tuple<std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>>, double> createAnisotropicClustering(const mesh::PtrMesh inMesh,const mesh::PtrMesh outMesh,  RADIAL_BASIS_FUNCTION_T function, Polynomial polynomial, unsigned int targetVerticesPerCluster) 
+inline std::tuple<std::vector<Eigen::Vector3d>, GlobalAnisotropyParams> createAnisotropicClustering(
+    const mesh::PtrMesh inMesh,
+    const mesh::PtrMesh outMesh, 
+    unsigned int targetVerticesPerCluster,
+    double overlapRatio = 0.1) 
 {
-    unsigned int mcSampleCount = 10;
-    double shapeParameter = 3.0;
-
-    // 1. 准备数据结构
-    std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>> clusters;
+    precice::logging::Logger _log{"impl::createAnisotropicClustering"};
+    // 1. Estimate Base Radius
+    precice::mesh::BoundingBox localBB = inMesh->index().getRtreeBounds();
+    double baseRadius = estimateClusterRadius(targetVerticesPerCluster, inMesh, localBB);
+    
+    // 2. Compute Global Anisotropy Params
+    GlobalAnisotropyParams params = computeGlobalAnisotropyParams(inMesh, baseRadius);
+    
+    // 3. Generate Cluster Centers
+    std::vector<Eigen::Vector3d> centers;
     int vertexCount = inMesh->vertices().size();
-    if (vertexCount == 0) return {clusters, 0.0};
+    if(vertexCount == 0) 
+        return {centers, params};
+    
+    // Define Transformation
+    Eigen::Vector3d center_mesh = localBB.center();
+    Eigen::Matrix3d T_inv = params.rotation.transpose();
+    
+    // Calculate Local Generation Bounds
+    Eigen::Vector3d local_min = Eigen::Vector3d::Constant(std::numeric_limits<double>::max());
+    Eigen::Vector3d local_max = Eigen::Vector3d::Constant(std::numeric_limits<double>::lowest());
+    
+    const int dim = inMesh->getDimensions();
+    
+    for(int i=0; i<8; ++i) {
+        Eigen::Vector3d p = Eigen::Vector3d::Zero();
+        
+        if (dim == 2 && i >= 4) break;
 
-    // vector<bool>标记覆盖状态
-    std::vector<bool> isCovered(vertexCount, false);
-    int coveredCount = 0;
-
-    std::vector<PilotPoint> pilotPoints = computePilotPoints(inMesh);
-
-    // Pilot Points的查询索引，用于快速查找最近导引点
-    mesh::Mesh pilotMesh("PilotMesh", 3, false);
-    for(const auto& p : pilotPoints) {
-        pilotMesh.createVertex(p.position);
+        p[0] = (i & 1) ? localBB.maxCorner()[0] : localBB.minCorner()[0];
+        p[1] = (i & 2) ? localBB.maxCorner()[1] : localBB.minCorner()[1];
+        if (dim == 3) {
+            p[2] = (i & 4) ? localBB.maxCorner()[2] : localBB.minCorner()[2];
+        }
+        
+        Eigen::Vector3d p_local = T_inv * (p - center_mesh);
+        local_min = local_min.cwiseMin(p_local);
+        local_max = local_max.cwiseMax(p_local);
     }
-    query::Index pilotIndex(pilotMesh);
-
-    // 输入网格的查询索引，用于计算基础半径
-    query::Index inputIndex(inMesh); 
-
-    // 随机数生成器，固定种子便于复现
-    std::mt19937 rng(12345);
-    std::uniform_int_distribution<int> dist(0, vertexCount - 1);
-    int candidateID = dist(rng);
-
-    // 一个简单的中心点列表，用于存储生成的Cluster中心
-    std::vector<Eigen::Vector3d> clusterCenters;
-
-    // 2. 迭代生成Cluster
-    // 终止条件可设为覆盖率达99%或连续多次无法找到有效新簇
-    int maxFailures = 100;
-    int failures = 0;
-
-    double maxRange = 0.0;
-
-    while (coveredCount < vertexCount) {
-        // --- 步骤 A: 蒙特卡洛优化的 FPS 采样 (注意事项1) ---
-        int bestCandidateID = -1;
-        double maxDistToExisting = -1.0;
-
-        // 抽取 M 个随机样本
-        for (unsigned int i = 0; i < mcSampleCount; ++i) {
-            int candidateID = dist(rng);
-            
-            // 如果已经被覆盖，跳过 (或寻找下一个未覆盖的)，可能多次无法找到簇
-            if (isCovered[candidateID]) continue;
-
-            const auto& candidatePos = inMesh->vertices()[candidateID].getCoords();
-
-            // 计算该候选点到"现有簇"的最短距离
-            double distToClosestCluster = std::numeric_limits<double>::max();
-            
-            if (!clusterCenters.empty()) {
-                // 这里简化为线性扫描现有中心。
-                // 随着簇数量增加，这里可以用 query::Index 优化，但考虑到FPS只需采样M个，
-                // M * N_clusters 的开销通常可接受。
-                for (const auto& center : clusterCenters) {
-                    double d = (candidatePos - center).norm();
-                    if (d < distToClosestCluster) distToClosestCluster = d;
-                }
-            }
-
-            if (distToClosestCluster > maxDistToExisting) {
-                maxDistToExisting = distToClosestCluster;
-                bestCandidateID = candidateID;
-            }
-        }
-
-        if (bestCandidateID == -1) {
-            failures++;
-            if (failures > maxFailures) break; // 无法找到未覆盖点，退出
-            continue; 
-        }
-        failures = 0; // 重置失败计数
-
-        // 选定新中心
-        const auto& newCenterPos = inMesh->vertices()[bestCandidateID].getCoords();
-        const auto& newCenterVertex = inMesh->vertices()[bestCandidateID];
-        // --- 步骤 B: 继承导引点特征 ---
-        // 找到最近的导引点
-        int nearestPilotIndex = pilotIndex.getClosestVertex(newCenterPos).index;
-        const PilotPoint& nearestPilot = pilotPoints[nearestPilotIndex];
-
-        // --- 步骤 C: 确定尺寸 ---
-        // 查询最近的 targetVerticesPerCluster 个邻居
-        auto kNearestVertexIDs = inputIndex.getClosestVertices(newCenterPos, targetVerticesPerCluster);
+    
+    // Add padding (1 radius)
+    // Note: radii are axis aligned in local space!
+    local_min -= params.semiAxes;
+    local_max += params.semiAxes;
+    
+    // Generate positions of cluster centers(in local space)
+    auto localPositions = generateLocalClusterCenters({local_min, local_max}, params.semiAxes, overlapRatio);
+    
+    // Transform to Global and Filter
+    // Filter condition: discard any centers that are too far outside the original Mesh Bounds
+    for(const auto& localPosition : localPositions) {
+        // Transform cluster centers back to global space
+        Eigen::Vector3d globalPosition = (params.rotation * localPosition) + center_mesh;
         
-        double baseRadius = 0.0;
-        if (!kNearestVertexIDs.empty()) {
-            // 选择最远的一个邻居距离作为基础半径
-            std::vector<double> squardRadius(kNearestVertexIDs.size());
-            std::transform(kNearestVertexIDs.begin(), kNearestVertexIDs.end(), squardRadius.begin(), [&inMesh, bestCandidateID](auto i){
-                return computeSquaredDifference(inMesh->vertex(i).rawCoords(), inMesh->vertex(bestCandidateID).rawCoords());
-            });
-            auto squardBaseRadius = std::max_element(squardRadius.begin(), squardRadius.end());
-            baseRadius = std::sqrt(*squardBaseRadius);
-        }
-        
-        // 防止半径过小
-        PRECICE_ASSERT(baseRadius > 1e-6, "Anisotropic cluster radius is smaller than 1e-6");
-
-        // --- 步骤 D: 创建各向异性簇 ---
-        AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T> newCluster(newCenterVertex, baseRadius, function, polynomial, inMesh, outMesh, nearestPilot, shapeParameter);
-        
-        clusters.push_back(newCluster);
-        clusterCenters.push_back(newCenterPos);
-
-        // --- 步骤 E: 更新覆盖状态 ---
-        // 粗筛：利用 R-Tree 找新簇包围盒内的点
-        // 精筛：用 Mahalanobis 距离判断
-        double searchRadius;
-        mesh::Mesh::VertexOffsets candidateIndices;
-        if (nearestPilot.type == FeatureType::LINEAR) {
-            // 面状为基础半径再压扁，体状为基础半径的圆球，因此最大搜索半径均为基础半径
-            searchRadius = baseRadius * shapeParameter;
-            candidateIndices = inputIndex.getClosestVertices(newCenterPos, searchRadius);
-
-            for (int idx : candidateIndices) {
-                if (isCovered[idx]) continue;
-
-                if (newCluster.isCovering(inMesh->vertices()[idx].getCoords())) {
-                    isCovered[idx] = true;
-                    coveredCount++;
-                }
-            }
-        } else if (nearestPilot.type == FeatureType::SURFACE) {
-            // 面状为基础半径再压扁，体状为基础半径的圆球，因此最大搜索半径均为基础半径
-            searchRadius = baseRadius;
-            candidateIndices = inputIndex.getClosestVertices(newCenterPos, searchRadius);
-
-            for (int idx : candidateIndices) {
-                if (isCovered[idx]) continue;
-
-                if (newCluster.isCovering(inMesh->vertices()[idx].getCoords())) {
-                    isCovered[idx] = true;
-                    coveredCount++;
-                }
-            }
-        } else if (nearestPilot.type == FeatureType::VOLUMETRIC) {
-            searchRadius = baseRadius;
-            candidateIndices = inputIndex.getClosestVertices(newCenterPos, searchRadius);
-
-            for (int idx : candidateIndices) {
-                if (isCovered[idx]) continue;
-
-                isCovered[idx] = true;
-                coveredCount++;
-            }
-        }
-        maxRange = std::max(maxRange, searchRadius);
-
+        if (inMesh->index().isAnyVertexInsideBox(mesh::Vertex({globalPosition, -1}), params.coverSearchRadius))
+            centers.push_back(globalPosition);
     }
-
-    return {clusters, maxRange};
+    
+    return {centers, params};
 }
 
 } // namespace precice::mapping::impl
