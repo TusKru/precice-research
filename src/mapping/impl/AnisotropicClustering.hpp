@@ -168,7 +168,7 @@ std::vector<Eigen::Vector3d> generateLocalClusterCenters(
     double overlap)
 {
     std::vector<Eigen::Vector3d> points;
-    Eigen::Vector3d step = 2.0 * radii * 0.5;// (1.0 - overlap);
+    Eigen::Vector3d step = 2.0 * radii * (1.0 - overlap);
     
     if(step.minCoeff() <= 1e-9) return points;
 
@@ -180,12 +180,12 @@ std::vector<Eigen::Vector3d> generateLocalClusterCenters(
     int nx = static_cast<int>(std::ceil((max.x() - min.x()) / step.x()));
     
     // Add buffer
-    nz += 2; ny += 2; nx += 2;
+    nz += 1; ny += 1; nx += 1;
     
     // Start a bit before min to cover edges after rotation/shifting
-    double start_z = min.z() - step.z();
-    double start_y = min.y() - step.y();
-    double start_x = min.x() - step.x();
+    double start_z = min.z();
+    double start_y = min.y();
+    double start_x = min.x();
 
     for (int k = 0; k < nz; ++k) {
         double z = start_z + k * step.z();
@@ -223,7 +223,7 @@ inline std::tuple<std::vector<Eigen::Vector3d>, GlobalAnisotropyParams> createAn
     const mesh::PtrMesh inMesh,
     const mesh::PtrMesh outMesh, 
     unsigned int targetVerticesPerCluster,
-    double overlapRatio = 0.1) 
+    double overlapRatio = 0.35) 
 {
     precice::logging::Logger _log{"impl::createAnisotropicClustering"};
     // 1. Estimate Base Radius
@@ -231,9 +231,12 @@ inline std::tuple<std::vector<Eigen::Vector3d>, GlobalAnisotropyParams> createAn
     double baseRadius = estimateClusterRadius(targetVerticesPerCluster, inMesh, localBB);
     
     // 2. Compute Global Anisotropy Params
+    precice::profiling::Event e1("clustering.computeGlobalAnisotropyParams");
     GlobalAnisotropyParams params = computeGlobalAnisotropyParams(inMesh, baseRadius);
-    
+    e1.stop();
+
     // 3. Generate Cluster Centers
+    precice::profiling::Event e2("clustering.generateClusterCenters");
     std::vector<Eigen::Vector3d> centers;
     int vertexCount = inMesh->vertices().size();
     if(vertexCount == 0) 
@@ -271,8 +274,10 @@ inline std::tuple<std::vector<Eigen::Vector3d>, GlobalAnisotropyParams> createAn
     local_max += params.semiAxes;
     
     // Generate positions of cluster centers(in local space)
+    precice::profiling::Event e21("clustering.generateClusterCenters.generateLocalClusterCenters");
     auto localPositions = generateLocalClusterCenters({local_min, local_max}, params.semiAxes, overlapRatio);
-    
+    e21.stop();
+
     // Transform to Global and Filter
     // Filter condition: discard any centers that are too far outside the original Mesh Bounds
     for(const auto& localPosition : localPositions) {
@@ -282,7 +287,7 @@ inline std::tuple<std::vector<Eigen::Vector3d>, GlobalAnisotropyParams> createAn
         if (inMesh->index().isAnyVertexInsideBox(mesh::Vertex({globalPosition, -1}), params.coverSearchRadius))
             centers.push_back(globalPosition);
     }
-    
+    e2.stop();
     return {centers, params};
 }
 

@@ -133,6 +133,7 @@ AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
 {
     // 1. Identify input and output vertex IDs within the anisotropic ellipsoidal region
     // Coarse filter: get vertices inside the bounding box defined by coverSearchRadius
+    precice::profiling::Event eq("map.pou.computeMapping.queryVertices");
     auto inIDs = inMesh->index().getVerticesInsideBox(center, params.coverSearchRadius);
     auto outIDs = outMesh->index().getVerticesInsideBox(center, params.coverSearchRadius);
 
@@ -152,7 +153,7 @@ AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
 
     _inputIDs.insert(inIDs.begin(), inIDs.end());
     _outputIDs.insert(outIDs.begin(), outIDs.end());
-
+    eq.stop();
     // 2. If the cluster is empty, we return immediately
     if (empty()) {
         return;
@@ -160,7 +161,7 @@ AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
 
     // 3. Re-initialize RBF Solver
     std::vector<bool> deadAxis(inMesh->getDimensions(), false);
-    
+    precice::profiling::Event e("map.pou.computeMapping.rbfSolver");
     _rbfSolver = RadialBasisFctSolver<RADIAL_BASIS_FUNCTION_T>{
         function, 
         *inMesh.get(), 
