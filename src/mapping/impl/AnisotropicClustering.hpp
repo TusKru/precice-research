@@ -214,6 +214,19 @@ std::vector<Eigen::Vector3d> generateLocalClusterCenters(
     return points;
 }
 
+bool isCovering(Eigen::Vector3d &c, const mesh::Vertex &v, Eigen::Matrix3d inverseCovariance)
+{
+    Eigen::Vector3d vPos;
+    if (v.getDimensions() == 3) {
+        vPos = v.getCoords();
+    } else {
+        vPos << v.coord(0), v.coord(1), 0.0;
+    }
+
+    Eigen::Vector3d diff = vPos - c;
+    return (diff.transpose() * inverseCovariance * diff) < 1 - math::NUMERICAL_ZERO_DIFFERENCE;
+}
+
 } // namespace
 
 /**
@@ -283,9 +296,19 @@ inline std::tuple<std::vector<Eigen::Vector3d>, GlobalAnisotropyParams> createAn
     for(const auto& localPosition : localPositions) {
         // Transform cluster centers back to global space
         Eigen::Vector3d globalPosition = (params.rotation * localPosition) + center_mesh;
+        mesh::Vertex globalVertex(globalPosition, -1);
         
-        if (inMesh->index().isAnyVertexInsideBox(mesh::Vertex({globalPosition, -1}), params.coverSearchRadius))
-            centers.push_back(globalPosition);
+        // if (inMesh->index().isAnyVertexInsideBox(mesh::Vertex({globalPosition, -1}), params.coverSearchRadius))
+        //     centers.push_back(globalPosition);
+        auto ids = inMesh->index().getVerticesInsideBox(globalVertex, params.coverSearchRadius);
+        if (ids.size() != 0) {
+            for (auto id : ids) {
+                if (isCovering(globalPosition, inMesh->vertex(id), params.inverseCovariance)) {
+                    centers.push_back(globalPosition);
+                    break;
+                }
+            }
+        }
     }
     e2.stop();
     return {centers, params};
