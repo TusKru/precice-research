@@ -76,7 +76,7 @@
             }
         },
         {
-            "name": "install",
+            "name": "mainInstallation",
             "description": "",
             "displayName": "",
             "inherits": [
