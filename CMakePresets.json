@@ -76,7 +76,7 @@
             }
         },
         {
-            "name": "local",
+            "name": "development-install",
             "description": "",
             "displayName": "",
             "inherits": [

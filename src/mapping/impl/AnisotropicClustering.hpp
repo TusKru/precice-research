@@ -131,13 +131,17 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
     params.rotation = R;
     
     // Determine semi-axes based on aspect ratio
-    // Smallest axis = baseRadius.
-    // axis_i = baseRadius * sqrt(lambda_i) / sqrt(lambda_min)
-    // lambda_min is lambda(2)
+    double maxRatio = 3.0; // 经验值，不允许长轴超过短轴的3倍
     double min_sqrt_lambda = std::sqrt(lambda(2));
     
-    params.semiAxes(0) = baseRadius * std::sqrt(lambda(0)) / min_sqrt_lambda;
-    params.semiAxes(1) = baseRadius * std::sqrt(lambda(1)) / min_sqrt_lambda;
+    double ratio0 = std::sqrt(lambda(0)) / min_sqrt_lambda;
+    double ratio1 = std::sqrt(lambda(1)) / min_sqrt_lambda;
+
+    ratio0 = std::min(ratio0, maxRatio);
+    ratio1 = std::min(ratio1, maxRatio);
+        
+    params.semiAxes(0) = baseRadius * ratio0;
+    params.semiAxes(1) = baseRadius * ratio1;
     params.semiAxes(2) = baseRadius;
     
     params.coverSearchRadius = params.semiAxes.maxCoeff();
