@@ -84,6 +84,7 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
     GlobalAnisotropyParams params;
     Eigen::Matrix3d globalCov = Eigen::Matrix3d::Zero();
     int validPilots = 0;
+    std::vector<Eigen::Matrix3d> localCovariances;
 
     std::vector<Eigen::Vector3d> pilotPositions = samplePilotPositions(inMesh);
     
@@ -106,6 +107,7 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
         Eigen::Matrix3d cov = (centered.adjoint() * centered) / double(data.rows() - 1);
         
         globalCov += cov;
+        localCovariances.push_back(cov);
         validPilots++;
     }
     
@@ -129,20 +131,64 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
     R << eigenvectors.col(2), eigenvectors.col(1), eigenvectors.col(0);
     
     params.rotation = R;
+
+    double coherenceScore = 0.0;
+    Eigen::Vector3d globalDir = eigenvectors.col(2);
+
+    if (validPilots > 0) {
+        for (const auto& cov : localCovariances) {
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(cov);
+            Eigen::Vector3d localDir = solver.eigenvectors().col(2); // 局部最大方向
+            coherenceScore += std::abs(localDir.dot(globalDir)); // abs因为轴向无正负之分
+        }
+        coherenceScore /= validPilots;
+    } else {
+        coherenceScore = 1.0; // 如果没有采样点，默认信任全局（或者0.0，视策略而定）
+    }
+
+    // 3. 动态计算最大长宽比 (Dynamic Aspect Ratio)
+    const double minScoreThreshold = 0.2; 
+    const double absoluteMaxRatio  = 3.5; 
+
+    double currentMaxRatio = 1.0;
+
+    if (coherenceScore > minScoreThreshold) {
+        // 1. 归一化 (Normalize) 到 [0, 1]
+        double t = (coherenceScore - minScoreThreshold) / (1.0 - minScoreThreshold);
+        
+        // 2. 非线性映射 (Non-linear Mapping)
+        double nonLinearFactor = t * t; 
+
+        // 3. 计算最终比例
+        currentMaxRatio = 1.0 + nonLinearFactor * (absoluteMaxRatio - 1.0);
+    } else {
+        currentMaxRatio = 1.0;
+    }
+
+    // ... 应用 currentMaxRatio 到 semiAxes ...
+    printf("Score: %.3f; MaxRatio: %.3f\n", coherenceScore, currentMaxRatio);
     
-    // Determine semi-axes based on aspect ratio
-    double maxRatio = 3.0; // 经验值，不允许长轴超过短轴的3倍
+    // 4. [修改] 应用动态限制 (Clamping)
     double min_sqrt_lambda = std::sqrt(lambda(2));
     
     double ratio0 = std::sqrt(lambda(0)) / min_sqrt_lambda;
     double ratio1 = std::sqrt(lambda(1)) / min_sqrt_lambda;
+    printf("ratio0: %.3f; ratio1: %.3f\n", ratio0, ratio1);
 
-    ratio0 = std::min(ratio0, maxRatio);
-    ratio1 = std::min(ratio1, maxRatio);
+    ratio0 = std::min(ratio0, currentMaxRatio);
+    ratio1 = std::min(ratio1, currentMaxRatio);
+
+    // 再进行阻尼回缩：让它往 1.0 (球形) 靠拢
+    // double damping = 0.8;
+    // ratio0 = 1.0 + damping * (ratio0 - 1.0);
+    // ratio1 = 1.0 + damping * (ratio1 - 1.0);
         
     params.semiAxes(0) = baseRadius * ratio0;
     params.semiAxes(1) = baseRadius * ratio1;
     params.semiAxes(2) = baseRadius;
+
+    printf(" | SemiAxes: [%.3f, %.3f, %.3f]\n", 
+        params.semiAxes(0), params.semiAxes(1), params.semiAxes(2));
     
     params.coverSearchRadius = params.semiAxes.maxCoeff();
     
