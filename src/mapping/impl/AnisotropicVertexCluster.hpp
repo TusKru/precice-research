@@ -113,6 +113,10 @@ private:
     /// Boolean switch in order to indicate that a mapping was computed
     bool _hasComputedMapping = false;
 
+    // Static, because it does not depend on the cluster shape.
+    // Distance will be normalized to 0~1
+    CompactPolynomialC2 _weightingFunction;
+
     // ------------------------------- Others ----------------------------
     
     // 运行时缓存的逆协方差矩阵，用于快速判断覆盖 (Mahalanobis distance)
@@ -129,25 +133,28 @@ AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
     mesh::PtrMesh inMesh,
     mesh::PtrMesh outMesh,
     const GlobalAnisotropyParams& params
-) : _center(center), _polynomial(polynomial), _function(function), _inverseCovariance(params.inverseCovariance)
+) : _center(center), _polynomial(polynomial), _function(function), _inverseCovariance(params.inverseCovariance), _weightingFunction(1.0)
 {
-    // 1. Identify input and output vertex IDs within the anisotropic ellipsoidal region
-    // Coarse filter: get vertices inside the bounding box defined by coverSearchRadius
+    PRECICE_TRACE(_center.getCoords());
+    PRECICE_ASSERT(_polynomial != Polynomial::ON, "Integrated polynomial is not supported for partition of unity data mappings.");
     precice::profiling::Event eq("map.pou.computeMapping.queryVertices");
     auto inIDs = inMesh->index().getVerticesInsideBox(center, params.coverSearchRadius);
     auto outIDs = outMesh->index().getVerticesInsideBox(center, params.coverSearchRadius);
 
     // Fine filter: check isCovering
     auto filterIDs = [&](mesh::Mesh::VertexOffsets& ids, mesh::PtrMesh mesh) {
-        for (auto it = ids.begin(); it != ids.end(); ) {
-            if (!isCovering(mesh->vertex(*it))) {
-                it = ids.erase(it);
-            } else {
-                ++it;
-            }
-        }
+        ids.erase(
+            std::remove_if(
+                ids.begin(),
+                ids.end(),
+                [&](VertexID id) {
+                    return !isCovering(mesh->vertex(id));
+                }
+            ),
+            ids.end()
+        );
     };
-    
+
     filterIDs(inIDs, inMesh);
     filterIDs(outIDs, outMesh);
 
@@ -295,11 +302,8 @@ double AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeD2(const mesh::
     Eigen::Vector3d center(c[0], c[1], c[2]);
 
     Eigen::Vector3d vPos;
-    if (v.getDimensions() == 3) {
-        vPos = v.getCoords();
-    } else {
-        vPos << v.coord(0), v.coord(1), 0.0;
-    }
+    auto vCoords = v.rawCoords();
+    vPos << vCoords[0], vCoords[1], vCoords[2];
 
     Eigen::Vector3d diff = vPos - center;
     return diff.transpose() * _inverseCovariance * diff;
@@ -316,8 +320,7 @@ double AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeWeight(const me
         // Use CompactPolynomialC2 to ensure monotonic decrease and 0 boundary
         // Formula: (1 - u)^4 * (4u + 1) where u = sqrt(d2)
         // Since we normalized boundary to 1.0, we use supportRadius = 1.0
-        static CompactPolynomialC2 weighting(1.0);
-        return weighting.evaluate(std::sqrt(d2));
+        return _weightingFunction.evaluate(std::sqrt(d2));
     }
 }
 
