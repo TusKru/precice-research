@@ -18,6 +18,8 @@
 
 namespace precice::mapping::impl {
 
+using Vertices = std::vector<mesh::Vertex>;
+
 namespace {
 
 /**
@@ -282,7 +284,7 @@ bool isCovering(Eigen::Vector3d &c, const mesh::Vertex &v, Eigen::Matrix3d inver
 /**
  * @brief Generate global anisotropic params and create Anisotropic Clustering with Global Params
  */
-inline std::tuple<std::vector<Eigen::Vector3d>, GlobalAnisotropyParams> createAnisotropicClustering(
+inline std::tuple<GlobalAnisotropyParams, Vertices> createAnisotropicClustering(
     const mesh::PtrMesh inMesh,
     const mesh::PtrMesh outMesh, 
     unsigned int targetVerticesPerCluster,
@@ -291,6 +293,7 @@ inline std::tuple<std::vector<Eigen::Vector3d>, GlobalAnisotropyParams> createAn
     precice::logging::Logger _log{"impl::createAnisotropicClustering"};
     // 1. Estimate Base Radius
     precice::mesh::BoundingBox localBB = inMesh->index().getRtreeBounds();
+    const int    inDim                 = inMesh->getDimensions();
     double baseRadius = estimateClusterRadius(targetVerticesPerCluster, inMesh, localBB);
     
     // 2. Compute Global Anisotropy Params
@@ -300,10 +303,9 @@ inline std::tuple<std::vector<Eigen::Vector3d>, GlobalAnisotropyParams> createAn
 
     // 3. Generate Cluster Centers
     precice::profiling::Event e2("clustering.generateClusterCenters");
-    std::vector<Eigen::Vector3d> centers;
     int vertexCount = inMesh->vertices().size();
     if(vertexCount == 0) 
-        return {centers, params};
+        return {params, Vertices{mesh::Vertex(Eigen::VectorXd::Zero(inDim), 0)}};
     
     // Define Transformation
     Eigen::Vector3d center_mesh = localBB.center();
@@ -343,25 +345,30 @@ inline std::tuple<std::vector<Eigen::Vector3d>, GlobalAnisotropyParams> createAn
 
     // Transform to Global and Filter
     // Filter condition: discard any centers that are too far outside the original Mesh Bounds
+    Vertices centers;
     for(const auto& localPosition : localPositions) {
         // Transform cluster centers back to global space
         Eigen::Vector3d globalPosition = (params.rotation * localPosition) + center_mesh;
         mesh::Vertex globalVertex(globalPosition, -1);
         
-        // if (inMesh->index().isAnyVertexInsideBox(mesh::Vertex({globalPosition, -1}), params.coverSearchRadius))
-        //     centers.push_back(globalPosition);
         auto ids = inMesh->index().getVerticesInsideBox(globalVertex, params.coverSearchRadius);
         if (ids.size() != 0) {
             for (auto id : ids) {
                 if (isCovering(globalPosition, inMesh->vertex(id), params.inverseCovariance)) {
-                    centers.push_back(globalPosition);
+                    if (inDim == 2) {
+                        mesh::Vertex v2d(globalPosition.head<2>(), centers.size());
+                        centers.push_back(v2d);
+                    } else if (inDim == 3) {
+                        mesh::Vertex v3d(globalPosition, centers.size());
+                        centers.push_back(v3d);
+                    }
                     break;
                 }
             }
         }
     }
     e2.stop();
-    return {centers, params};
+    return {params, centers};
 }
 
 } // namespace precice::mapping::impl

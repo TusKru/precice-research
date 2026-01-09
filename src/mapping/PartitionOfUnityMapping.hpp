@@ -166,9 +166,7 @@ template <typename RADIAL_BASIS_FUNCTION_T>
 void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeMapping()
 {
   PRECICE_TRACE();
-
   precice::profiling::Event e1("mapping.computeMapping");
-
   precice::profiling::Event e("map.pou.computeMapping.From" + this->input()->getName() + "To" + this->output()->getName(), profiling::Synchronize);
 
   // Recompute the whole clustering
@@ -185,37 +183,32 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeMapping()
   }
 
   precice::profiling::Event e2("mapping.createClustering");
-
   precice::profiling::Event eClusters("map.pou.computeMapping.createClustering.From" + this->input()->getName() + "To" + this->output()->getName());
   // Step 1: get clustering centers and global anisotropy params
-  auto [centerCandidates, params] = impl::createAnisotropicClustering(inMesh, outMesh, _verticesPerCluster, _relativeOverlap);
+  auto [params, centerCandidates] = impl::createAnisotropicClustering(inMesh, outMesh, _verticesPerCluster, _relativeOverlap);
   eClusters.stop();
-
   e2.stop();
 
   _anisoParams = params;
   _coverSearchRadius = params.coverSearchRadius; // Use max semi-axis as the conservative radius
-  
   PRECICE_ASSERT(_coverSearchRadius > 0 || inMesh->nVertices() == 0 || outMesh->nVertices() == 0);
 
   // Step 2: check, which of the resulting clusters are non-empty and register the cluster centers in a mesh
   // Here, the VertexCluster computes the matrix decompositions directly in case the cluster is non-empty
-  precice::profiling::Event e3("mapping.createCluster");
   _centerMesh        = std::make_unique<mesh::Mesh>("pou-centers-" + inMesh->getName(), this->getDimensions(), mesh::Mesh::MESH_ID_UNDEFINED);
   auto &meshVertices = _centerMesh->vertices();
-
+  
   meshVertices.clear();
   _clusters.clear();
   _clusters.reserve(centerCandidates.size());
   
+  precice::profiling::Event e3("mapping.createCluster");
   // Note: centerCandidates is now vector<Vector3d>, we need to create Vertices
-  int clusterID = 0;
-  for (const auto &cCoords : centerCandidates) {
+  for (const auto &c : centerCandidates) {
     // We cannot simply copy the vertex from the container in order to fill the vertices of the centerMesh, as the vertexID of each center needs to match the index
     // of the cluster within the _clusters vector. That's required for the indexing further down and asserted below
     const VertexID                                  vertexID = meshVertices.size();
-    mesh::Vertex                                    center(cCoords, vertexID);
-    
+    mesh::Vertex                                    center(c.getCoords(), vertexID);
     AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T> cluster(center, _basisFunction, _polynomial, inMesh, outMesh, params);
 
     // Consider only non-empty clusters (more of a safeguard here)
@@ -224,7 +217,6 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeMapping()
       meshVertices.emplace_back(std::move(center));
       _clusters.emplace_back(std::move(cluster));
     }
-    clusterID++;
   }
   e3.stop();
 
@@ -259,7 +251,6 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeMapping()
   eWeights.stop();
 
   e4.stop();
-  e1.stop();
   // Uncomment to add a VTK export of the cluster center distribution for visualization purposes
   exportClusterCentersAsVTU(*_centerMesh);
 
