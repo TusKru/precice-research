@@ -186,7 +186,7 @@ void SphericalVertexCluster<RADIAL_BASIS_FUNCTION_T>::setNormalizedWeight(double
 {
   PRECICE_ASSERT(_outputIDs.size() > 0);
   PRECICE_ASSERT(_outputIDs.contains(id), id);
-  PRECICE_ASSERT(normalizedWeight > 0);
+  PRECICE_ASSERT(normalizedWeight >= 0.0);
 
   if (_normalizedWeights.size() == 0)
     _normalizedWeights.resize(_outputIDs.size());

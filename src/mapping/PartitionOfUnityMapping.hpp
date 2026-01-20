@@ -271,7 +271,7 @@ std::pair<std::vector<int>, std::vector<double>> PartitionOfUnityMapping<RADIAL_
   // Note: this could also be done on-the-fly in the map data phase for dynamic queries, which would require to make the mesh as well as the indexTree member variables.
 
   // Step 2a: get the relevant clusters for the output vertex
-  auto       clusterIDs            = clusterIndex.getVerticesInsideBox(vertex, _clusterRadius);
+  auto       clusterIDs            = clusterIndex.getVerticesInsideBox(vertex, _clusterRadius - math::NUMERICAL_ZERO_DIFFERENCE);
   const auto localNumberOfClusters = clusterIDs.size();
 
   // Consider the case where we didn't find any cluster (meshes don't match very well)
