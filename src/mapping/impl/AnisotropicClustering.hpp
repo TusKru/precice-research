@@ -83,8 +83,21 @@ std::vector<Eigen::Vector3d> samplePilotPositions(const mesh::PtrMesh inMesh)
  */
 GlobalAnisotropyParams computeGlobalAnisotropyParams(
     const mesh::PtrMesh inMesh,
-    double baseRadius)
+    double baseRadius,
+    bool useDynamicRatio,
+    double staticRatio1,
+    double staticRatio2)
 {
+    if (staticRatio1 >= 1.0 || staticRatio2 >= 1.0) {
+        printf("[Anisotropic DEBUG] GlobalAnisotropy: Using static anisotropic ratios [%f, %f].\n", staticRatio1, staticRatio2);
+    } else {
+        if (useDynamicRatio) {
+            printf("[Anisotropic DEBUG] GlobalAnisotropy: Using dynamic anisotropic ratio based on local PCA analysis.\n");
+        } else {
+            printf("[Anisotropic DEBUG] GlobalAnisotropy: Using Geometry ratio.\n");
+        }
+    }
+
     // 获取全局均匀取样点
     std::vector<Eigen::Vector3d> pilotPositions = samplePilotPositions(inMesh);
     const int nPos = pilotPositions.size();
@@ -129,12 +142,12 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
         // --- 2D/3D 特征值选择 ---
         if (dim == 2) {
             // 2D 情况下，locEvals(0) 是 Z 轴的 0 (或极小噪声)，应忽略。
-            minLambda = std::max(locEvals(1), 1e-12);
-            maxLambda = std::max(locEvals(2), 1e-12);
+            minLambda = std::max(locEvals(1), 1e-10);
+            maxLambda = std::max(locEvals(2), 1e-10);
         } else {
             // 3D 情况下，0 是最小轴
-            minLambda = std::max(locEvals(0), 1e-12);
-            maxLambda = std::max(locEvals(2), 1e-12);
+            minLambda = std::max(locEvals(0), 1e-10);
+            maxLambda = std::max(locEvals(2), 1e-10);
         }
         
         // 计算几何长宽比
@@ -175,10 +188,6 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
     
     eigenvalues = eigenvalues.cwiseMax(1e-10);
     
-    // 排序: Lambda0 >= Lambda1 >= Lambda2
-    Eigen::Vector3d sortedEvals;
-    sortedEvals << eigenvalues(2), eigenvalues(1), eigenvalues(0);
-    
     Eigen::Matrix3d R;
     R << eigenvectors.col(2), eigenvectors.col(1), eigenvectors.col(0);
     // --- 2D 模式下的旋转矩阵清洗 ---
@@ -209,46 +218,79 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
     coherenceScore /= validPilots;
 
     // 动态限制 (Dynamic Limit)
-    const double minScoreThreshold = 0.4; 
-    const double absoluteMaxRatio  = 2.0; 
+    const double minScoreThreshold = 0.4;
+    const double absoluteMinRatio  = 1.5;
+    const double absoluteMaxRatio  = 2.5; 
 
-    double allowedMaxRatio = 1.0;
-    if (coherenceScore > minScoreThreshold) {
+    double dynamicMaxRatio = 1.0;
+    if (useDynamicRatio && coherenceScore > minScoreThreshold) {
         double t = (coherenceScore - minScoreThreshold) / (1.0 - minScoreThreshold);
-        allowedMaxRatio = 1.0 + (t * t) * (absoluteMaxRatio - 1.0);
+        dynamicMaxRatio = absoluteMinRatio + (t * t) * (absoluteMaxRatio - absoluteMinRatio);
     }
+    
+    // 排序: Lambda0 >= Lambda1 >= Lambda2
+    Eigen::Vector3d sortedEvals;
+    sortedEvals << eigenvalues(2), eigenvalues(1), eigenvalues(0);
+    Eigen::Vector3d semiAxesRatio;
+    semiAxesRatio(0) = std::sqrt(eigenvalues(2));
+    semiAxesRatio(1) = std::sqrt(eigenvalues(1));
+    semiAxesRatio(2) = std::sqrt(eigenvalues(0));
 
-    // 计算最终轴长
-    double min_sqrt_lambda;
-    
+    double geomRatio0, geomRatio1;
+    double finalRatio0, finalRatio1;
+    double norConstant;
     if (dim == 2) {
-        // 2D 下，使用 sortedEvals(1) (平面内短轴) 作为基准。
-        min_sqrt_lambda = std::sqrt(std::max(sortedEvals(1), 1e-12));
+        geomRatio0 = semiAxesRatio(0) / semiAxesRatio(1);
+
+        if (staticRatio1 >= 1.0) {
+            finalRatio0 = staticRatio1;
+        } else if (useDynamicRatio) {
+            finalRatio0 = std::min(geomRatio0, dynamicMaxRatio);
+        } else {
+            finalRatio0 = geomRatio0;
+        }
+
+        norConstant = std::sqrt(finalRatio0 * 1.0);
+
+        params.semiAxes(0) = baseRadius * finalRatio0 / norConstant;
+        params.semiAxes(1) = baseRadius * 1.0 / norConstant;
+        params.semiAxes(2) = params.semiAxes(1);
     } else {
-        // 3D 下，使用 sortedEvals(2) (最小轴)
-        min_sqrt_lambda = std::sqrt(std::max(sortedEvals(2), 1e-12));
+        geomRatio0 = semiAxesRatio(0) / semiAxesRatio(2);
+        geomRatio1 = semiAxesRatio(1) / semiAxesRatio(2);
+
+        // 默认使用几何或动态限制
+        if (useDynamicRatio) {
+            finalRatio0 = std::min(geomRatio0, dynamicMaxRatio);
+            finalRatio1 = std::min(geomRatio1, dynamicMaxRatio);
+        } else {
+            finalRatio0 = geomRatio0;
+            finalRatio1 = geomRatio1;
+        }
+        // 独立应用静态比率覆盖
+        if (staticRatio1 >= 1.0) {
+            finalRatio0 = staticRatio1;
+        }
+        if (staticRatio2 >= 1.0) {
+            finalRatio1 = staticRatio2;
+        }
+
+        norConstant = std::cbrt(finalRatio0 * finalRatio1 * 1.0);
+
+        params.semiAxes(0) = baseRadius * finalRatio0 / norConstant;
+        params.semiAxes(1) = baseRadius * finalRatio1 / norConstant;
+        params.semiAxes(2) = baseRadius * 1.0 / norConstant;
     }
-    
-    double geomRatio0 = std::sqrt(sortedEvals(0)) / min_sqrt_lambda;
-    double geomRatio1 = std::sqrt(sortedEvals(1)) / min_sqrt_lambda;
-    
-    // 应用 Coherence 限制
-    double finalRatio0 = std::min(geomRatio0, allowedMaxRatio);
-    double finalRatio1 = std::min(geomRatio1, allowedMaxRatio);
-    
-    // 保证没有任何轴小于 baseRadius (避免空洞)
-    // 策略：最短轴 = baseRadius，其他轴放大
-    params.semiAxes(0) = baseRadius * finalRatio0;
-    params.semiAxes(1) = baseRadius * finalRatio1;
-    params.semiAxes(2) = baseRadius;
-    params.coverSearchRadius = params.semiAxes.maxCoeff();
+    params.coverSearchRadius = params.semiAxes(0);
     
     printf("@@@@@@ GlobalAnisotropyParams @@@@@@\n");
-    printf("Pilots: %d/%d; Score: %.3f; AllowedRatio: %.3f\n", validPilots, nPos, coherenceScore, allowedMaxRatio);
-    printf("GeomRatio: [%.2f, %.2f] -> FinalRatio: [%.2f, %.2f]\n", 
-           geomRatio0, geomRatio1, finalRatio0, finalRatio1);
-    printf("SemiAxes: [%.4f, %.4f, %.4f]\n", 
-           params.semiAxes(0), params.semiAxes(1), params.semiAxes(2));
+    printf("Pilots: %d/%d; Score: %.3f; AllowedRatio: %.3f\n", validPilots, nPos, coherenceScore, dynamicMaxRatio);
+    printf("useDynamicRatio: %d; GeomRatio: [%.2f, %.2f] -> FinalRatio: [%.2f, %.2f]\n", 
+           useDynamicRatio, geomRatio0, geomRatio1, finalRatio0, finalRatio1);
+    printf("Rotation Matrix R:\n");
+    printf("[%.4f %.4f %.4f]\n", R(0,0), R(0,1), R(0,2));
+    printf("[%.4f %.4f %.4f]\n", R(1,0), R(1,1), R(1,2));
+    printf("[%.4f %.4f %.4f]\n", R(2,0), R(2,1), R(2,2));
     printf("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n");
 
     // 逆协方差 M
@@ -394,19 +436,6 @@ Vertices createClusterCenters(
     return centers;
 }
 
-bool isCovering(Eigen::Vector3d &c, const mesh::Vertex &v, Eigen::Matrix3d inverseCovariance)
-{
-    Eigen::Vector3d vPos;
-    if (v.getDimensions() == 3) {
-        vPos = v.getCoords();
-    } else {
-        vPos << v.coord(0), v.coord(1), 0.0;
-    }
-
-    Eigen::Vector3d diff = vPos - c;
-    return (diff.transpose() * inverseCovariance * diff) < 1 - math::NUMERICAL_ZERO_DIFFERENCE;
-}
-
 /**
  * @brief Project generated centers to the closest mesh vertices and remove duplicates.
  * This effectively "snaps" the lattice to the manifold surface.
@@ -446,44 +475,57 @@ std::vector<Eigen::Vector3d> projectAndUniqueCenters(
     return finalCenters;
 }
 
-/**
- * @brief Filter out clusters that do not cover enough vertices based on Anisotropic metric.
- * Equivalent to "tagEmptyClusters" but for Ellipsoids.
- */
-Vertices filterEmptyAnisotropicClusters(
-    const std::vector<Eigen::Vector3d>& candidatePositions,
-    const mesh::PtrMesh inMesh,
-    const GlobalAnisotropyParams& params)
+bool isCovering(const mesh::Vertex &v1, const mesh::Vertex &v2, Eigen::Matrix3d inverseCovariance)
 {
-    Vertices validCenters;
-    int currentID = 0;
-    const int dim = inMesh->getDimensions();
+    PRECICE_ASSERT(v1.getDimensions() == v2.getDimensions());
+    const unsigned int dim = v1.getDimensions();
 
-    for (const auto& pos : candidatePositions) {
-        mesh::Vertex centerV(pos, -1);
-        
-        // 1. 粗筛选：先用 R-Tree 找覆盖半径内的点
-        auto ids = inMesh->index().getVerticesInsideBox(centerV, params.coverSearchRadius);
-        
-        // 2. 精筛选：使用马哈拉诺比斯距离判断椭球覆盖
-        bool isNonEmpty = false;
-        for (auto id : ids) {
-            if (isCovering(const_cast<Eigen::Vector3d&>(pos), inMesh->vertex(id), params.inverseCovariance)) {
-                isNonEmpty = true;
-                break; // 只要覆盖到一个点，这个簇就是有效的
+    Eigen::Vector3d pos1;
+    Eigen::Vector3d pos2;
+
+    pos1(0) = v1.coord(0);
+    pos1(1) = v1.coord(1);
+    pos1(2) = dim == 3 ? v1.coord(2) : 0.0;
+
+    pos2(0) = v2.coord(0);
+    pos2(1) = v2.coord(1);
+    pos2(2) = dim == 3 ? v2.coord(2) : 0.0;
+
+    Eigen::Vector3d diff = pos1 - pos2;
+    return (diff.transpose() * inverseCovariance * diff) < 1 - math::NUMERICAL_ZERO_DIFFERENCE;
+}
+
+/**
+ * @brief Equivalent to "tagEmptyClusters" but for Ellipsoids.
+ */
+void tagEmptyAnisotropicClusters(
+    Vertices &clusterCenters, 
+    GlobalAnisotropyParams &params,
+    mesh::PtrMesh mesh)
+{
+    const Eigen::Matrix3d inverseCovariance = params.inverseCovariance;
+    const double coverSearchRadius = params.coverSearchRadius;
+
+    std::for_each(clusterCenters.begin(), clusterCenters.end(), [&](auto &v) {
+        if (!v.isTagged()) {
+            auto ids = mesh->index().getVerticesInsideBox(v, coverSearchRadius);
+            if (ids.size() == 0){
+                v.tag();
+            }
+            else {
+                bool empty = true;
+                for (auto id : ids) {
+                    if (isCovering(v, mesh->vertex(id), inverseCovariance)) {
+                        empty = false;
+                        break;
+                    }
+                }
+                if (empty == true) {
+                    v.tag();
+                }
             }
         }
-
-        if (isNonEmpty) {
-            int dim = inMesh->getDimensions();
-            if (dim == 2) {
-                validCenters.emplace_back(pos.head<2>(), currentID++);
-            } else {
-                validCenters.emplace_back(pos, currentID++);
-            }
-        }
-    }
-    return validCenters;
+    });
 }
 
 } // namespace
@@ -495,8 +537,11 @@ inline std::tuple<GlobalAnisotropyParams, Vertices> createAnisotropicClustering(
     const mesh::PtrMesh inMesh,
     const mesh::PtrMesh outMesh, 
     unsigned int targetVerticesPerCluster,
-    double overlapRatio = 0.15,
-    bool projectToInput = true) 
+    double overlapRatio,
+    bool projectToInput,
+    bool useDynamicRatio,
+    double staticRatio1,
+    double staticRatio2) 
 {
     precice::logging::Logger _log{"impl::createAnisotropicClustering"};
     // 1. Estimate Base Radius
@@ -505,18 +550,16 @@ inline std::tuple<GlobalAnisotropyParams, Vertices> createAnisotropicClustering(
     double baseRadius = estimateClusterRadius(targetVerticesPerCluster, inMesh, globalBB);
     
     // 2. Compute Global Anisotropy Params
-    precice::profiling::Event e1("clustering.computeGlobalAnisotropyParams");
-    GlobalAnisotropyParams params = computeGlobalAnisotropyParams(inMesh, baseRadius);
-    e1.stop();
+    GlobalAnisotropyParams params = computeGlobalAnisotropyParams(inMesh, baseRadius, useDynamicRatio, staticRatio1, staticRatio2);
 
     // 3. Generate Cluster Centers
-    precice::profiling::Event e2("clustering.createClusterCenters");
     if(inMesh->vertices().size() == 0) 
         return {params, Vertices{mesh::Vertex(Eigen::VectorXd::Zero(dim), 0)}};
     
     Vertices centers = createClusterCenters(globalBB, params, overlapRatio, dim);
     
-    tagEmptyClusters(centers, params.semiAxes.minCoeff(), inMesh);
+    // tagEmptyClusters(centers, params.semiAxes.minCoeff(), inMesh);
+    tagEmptyAnisotropicClusters(centers, params, inMesh);
 
     if (projectToInput) {
         // globalCandidates = projectAndUniqueCenters(globalCandidates, inMesh);
@@ -524,7 +567,6 @@ inline std::tuple<GlobalAnisotropyParams, Vertices> createAnisotropicClustering(
     }
     removeTaggedVertices(centers);
     // Vertices centers = filterEmptyAnisotropicClusters(globalCandidates, inMesh, params);
-    e2.stop();
     printf("Generated %lu centers (Anisotropic)\n", centers.size());
     
     return {params, centers};

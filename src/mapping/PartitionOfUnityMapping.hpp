@@ -6,6 +6,8 @@
 #include "com/Communication.hpp"
 #include "io/ExportVTU.hpp"
 #include "mapping/impl/AnisotropicClustering.hpp"
+#include "mapping/impl/CreateClustering.hpp"
+#include "mapping/impl/SphericalVertexCluster.hpp"
 #include "mapping/impl/MappingDataCache.hpp"
 #include "mapping/impl/AnisotropicVertexCluster.hpp"
 #include "mesh/Filter.hpp"
@@ -51,7 +53,11 @@ public:
       Polynomial              polynomial,
       unsigned int            verticesPerCluster,
       double                  relativeOverlap,
-      bool                    projectToInput);
+      bool                    projectToInput,
+      bool                    useDynamicRatio = true,
+      bool                    useAnisotropic = false,
+      double                  staticRatio1 = -1.0,
+      double                  staticRatio2 = -1.0);
 
   /**
    * Computes the clustering for the partition of unity method and fills the \p _clusters vector,
@@ -93,6 +99,7 @@ private:
 
   /// main data container storing all the clusters, which need to be solved individually
   std::vector<AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>> _clusters;
+  std::vector<SphericalVertexCluster<RADIAL_BASIS_FUNCTION_T>>   _clustersSpherical;
 
   /// Radial basis function type used in interpolation
   RADIAL_BASIS_FUNCTION_T _basisFunction;
@@ -107,9 +114,14 @@ private:
 
   /// toggles whether we project the cluster centers to the input mesh
   const bool _projectToInput;
+  const bool _useDynamicRatio;
+  const bool _useAnisotropic;
+  const double _staticRatio1;
+  const double _staticRatio2;
 
   /// derived parameter based on the input above: the radius of each cluster
   double _coverSearchRadius = 0;
+  double _clusterRadius = 0;
   
   GlobalAnisotropyParams _anisoParams;
 
@@ -144,9 +156,14 @@ PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::PartitionOfUnityMapping(
     Polynomial              polynomial,
     unsigned int            verticesPerCluster,
     double                  relativeOverlap,
-    bool                    projectToInput)
+    bool                    projectToInput,
+    bool                    useDynamicRatio,
+    bool                    useAnisotropic,
+    double                  staticRatio1,
+    double                  staticRatio2)
     : Mapping(constraint, dimension, false, Mapping::InitialGuessRequirement::None),
-      _basisFunction(function), _verticesPerCluster(verticesPerCluster), _relativeOverlap(relativeOverlap), _projectToInput(projectToInput), _polynomial(polynomial)
+      _basisFunction(function), _verticesPerCluster(verticesPerCluster), _relativeOverlap(relativeOverlap), _projectToInput(projectToInput), _polynomial(polynomial),
+      _useDynamicRatio(useDynamicRatio), _useAnisotropic(useAnisotropic), _staticRatio1(staticRatio1), _staticRatio2(staticRatio2)
 {
   PRECICE_ASSERT(this->getDimensions() <= 3);
   PRECICE_ASSERT(_polynomial != Polynomial::ON, "Integrated polynomial is not supported for partition of unity data mappings.");
@@ -166,7 +183,6 @@ template <typename RADIAL_BASIS_FUNCTION_T>
 void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeMapping()
 {
   PRECICE_TRACE();
-  precice::profiling::Event e1("mapping.computeMapping");
   precice::profiling::Event e("map.pou.computeMapping.From" + this->input()->getName() + "To" + this->output()->getName(), profiling::Synchronize);
 
   // Recompute the whole clustering
@@ -182,16 +198,21 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeMapping()
     outMesh = this->output();
   }
 
-  precice::profiling::Event e2("mapping.createClustering");
   precice::profiling::Event eClusters("map.pou.computeMapping.createClustering.From" + this->input()->getName() + "To" + this->output()->getName());
-  // Step 1: get clustering centers and global anisotropy params
-  auto [params, centerCandidates] = impl::createAnisotropicClustering(inMesh, outMesh, _verticesPerCluster, _relativeOverlap);
+  std::vector<mesh::Vertex> centerCandidates;
+  if (_useAnisotropic) {
+    auto [params, centers] = impl::createAnisotropicClustering(inMesh, outMesh, _verticesPerCluster, _relativeOverlap, _projectToInput, _useDynamicRatio, _staticRatio1, _staticRatio2);
+    _anisoParams           = params;
+    _coverSearchRadius     = params.coverSearchRadius; // Use max semi-axis as the conservative radius
+    centerCandidates       = std::move(centers);
+    PRECICE_ASSERT(_coverSearchRadius > 0 || inMesh->nVertices() == 0 || outMesh->nVertices() == 0);
+  } else {
+    auto [radius, centers] = impl::createClustering(inMesh, outMesh, _relativeOverlap, _verticesPerCluster, _projectToInput);
+    _clusterRadius         = radius;
+    centerCandidates       = std::move(centers);
+    PRECICE_ASSERT(_clusterRadius > 0 || inMesh->nVertices() == 0 || outMesh->nVertices() == 0);
+  }
   eClusters.stop();
-  e2.stop();
-
-  _anisoParams = params;
-  _coverSearchRadius = params.coverSearchRadius; // Use max semi-axis as the conservative radius
-  PRECICE_ASSERT(_coverSearchRadius > 0 || inMesh->nVertices() == 0 || outMesh->nVertices() == 0);
 
   // Step 2: check, which of the resulting clusters are non-empty and register the cluster centers in a mesh
   // Here, the VertexCluster computes the matrix decompositions directly in case the cluster is non-empty
@@ -200,37 +221,53 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeMapping()
   
   meshVertices.clear();
   _clusters.clear();
-  _clusters.reserve(centerCandidates.size());
-  
-  precice::profiling::Event e3("mapping.createCluster");
-  // Note: centerCandidates is now vector<Vector3d>, we need to create Vertices
-  for (const auto &c : centerCandidates) {
-    // We cannot simply copy the vertex from the container in order to fill the vertices of the centerMesh, as the vertexID of each center needs to match the index
-    // of the cluster within the _clusters vector. That's required for the indexing further down and asserted below
-    const VertexID                                  vertexID = meshVertices.size();
-    mesh::Vertex                                    center(c.getCoords(), vertexID);
-    AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T> cluster(center, _basisFunction, _polynomial, inMesh, outMesh, params);
-
-    // Consider only non-empty clusters (more of a safeguard here)
-    if (!cluster.empty()) {
-      PRECICE_ASSERT(center.getID() == static_cast<int>(_clusters.size()), center.getID(), _clusters.size());
-      meshVertices.emplace_back(std::move(center));
-      _clusters.emplace_back(std::move(cluster));
+  _clustersSpherical.clear();
+  if (_useAnisotropic) {
+    _clusters.reserve(centerCandidates.size());
+    for (const auto &c : centerCandidates) {
+      const VertexID                                  vertexID = meshVertices.size();
+      mesh::Vertex                                    center(c.getCoords(), vertexID);
+      AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T> cluster(center, _basisFunction, _polynomial, inMesh, outMesh, _anisoParams);
+      if (!cluster.empty()) {
+        PRECICE_ASSERT(center.getID() == static_cast<int>(_clusters.size()), center.getID(), _clusters.size());
+        meshVertices.emplace_back(std::move(center));
+        _clusters.emplace_back(std::move(cluster));
+      }
+    }
+  } else {
+    _clustersSpherical.reserve(centerCandidates.size());
+    for (const auto &c : centerCandidates) {
+      const VertexID                                vertexID = meshVertices.size();
+      mesh::Vertex                                  center(c.getCoords(), vertexID);
+      SphericalVertexCluster<RADIAL_BASIS_FUNCTION_T> cluster(center, _clusterRadius, _basisFunction, _polynomial, inMesh, outMesh);
+      if (!cluster.empty()) {
+        PRECICE_ASSERT(center.getID() == static_cast<int>(_clustersSpherical.size()), center.getID(), _clustersSpherical.size());
+        meshVertices.emplace_back(std::move(center));
+        _clustersSpherical.emplace_back(std::move(cluster));
+      }
     }
   }
-  e3.stop();
 
-  e.addData("n clusters", _clusters.size());
+  e.addData("n clusters", _useAnisotropic ? _clusters.size() : _clustersSpherical.size());
   // Log the average number of resulting clusters
-  PRECICE_DEBUG("Partition of unity data mapping between mesh \"{}\" and mesh \"{}\": mesh \"{}\" on rank {} was decomposed into {} clusters.", this->input()->getName(), this->output()->getName(), inMesh->getName(), utils::IntraComm::getRank(), _clusters.size());
+  
+  if (_useAnisotropic) {
+    if (_clusters.size() > 0) {
+      PRECICE_DEBUG("Partition of unity data mapping between mesh \"{}\" and mesh \"{}\": mesh \"{}\" on rank {} was decomposed into {} clusters.", this->input()->getName(), this->output()->getName(), inMesh->getName(), utils::IntraComm::getRank(), _clusters.size());
 
-  if (_clusters.size() > 0) {
-    PRECICE_DEBUG("Average number of vertices per cluster {}", std::accumulate(_clusters.begin(), _clusters.end(), static_cast<unsigned int>(0), [](auto &acc, auto &val) { return acc += val.getNumberOfInputVertices(); }) / _clusters.size());
-    PRECICE_DEBUG("Maximum number of vertices per cluster {}", std::max_element(_clusters.begin(), _clusters.end(), [](auto &v1, auto &v2) { return v1.getNumberOfInputVertices() < v2.getNumberOfInputVertices(); })->getNumberOfInputVertices());
-    PRECICE_DEBUG("Minimum number of vertices per cluster {}", std::min_element(_clusters.begin(), _clusters.end(), [](auto &v1, auto &v2) { return v1.getNumberOfInputVertices() < v2.getNumberOfInputVertices(); })->getNumberOfInputVertices());
+      PRECICE_DEBUG("Average number of vertices per cluster {}", std::accumulate(_clusters.begin(), _clusters.end(), static_cast<unsigned int>(0), [](auto &acc, auto &val) { return acc += val.getNumberOfInputVertices(); }) / _clusters.size());
+      PRECICE_DEBUG("Maximum number of vertices per cluster {}", std::max_element(_clusters.begin(), _clusters.end(), [](auto &v1, auto &v2) { return v1.getNumberOfInputVertices() < v2.getNumberOfInputVertices(); })->getNumberOfInputVertices());
+      PRECICE_DEBUG("Minimum number of vertices per cluster {}", std::min_element(_clusters.begin(), _clusters.end(), [](auto &v1, auto &v2) { return v1.getNumberOfInputVertices() < v2.getNumberOfInputVertices(); })->getNumberOfInputVertices());
+    }
+  } else {
+    if (_clustersSpherical.size() > 0) {
+      PRECICE_DEBUG("Partition of unity data mapping between mesh \"{}\" and mesh \"{}\": mesh \"{}\" on rank {} was decomposed into {} clusters.", this->input()->getName(), this->output()->getName(), inMesh->getName(), utils::IntraComm::getRank(), _clustersSpherical.size());
+
+      PRECICE_DEBUG("Average number of vertices per cluster {}", std::accumulate(_clustersSpherical.begin(), _clustersSpherical.end(), static_cast<unsigned int>(0), [](auto &acc, auto &val) { return acc += val.getNumberOfInputVertices(); }) / _clustersSpherical.size());
+      PRECICE_DEBUG("Maximum number of vertices per cluster {}", std::max_element(_clustersSpherical.begin(), _clustersSpherical.end(), [](auto &v1, auto &v2) { return v1.getNumberOfInputVertices() < v2.getNumberOfInputVertices(); })->getNumberOfInputVertices());
+      PRECICE_DEBUG("Minimum number of vertices per cluster {}", std::min_element(_clustersSpherical.begin(), _clustersSpherical.end(), [](auto &v1, auto &v2) { return v1.getNumberOfInputVertices() < v2.getNumberOfInputVertices(); })->getNumberOfInputVertices());
+    }
   }
-
-  precice::profiling::Event e4("mapping.computeNormalizedWeight");
 
   precice::profiling::Event eWeights("map.pou.computeMapping.computeWeights");
   // Log a bounding box of the center mesh
@@ -240,17 +277,19 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeMapping()
   // Step 3: Determine PU weights
   PRECICE_DEBUG("Computing cluster-vertex association");
   for (const auto &vertex : outMesh->vertices()) {
-    // we use a helper function, as we need the same functionality for just-in-time mapping
     auto [clusterIDs, normalizedWeights] = computeNormalizedWeight(vertex, outMesh->getName());
-    // Step 4: store the normalized weight in all associated clusters
     for (unsigned int i = 0; i < clusterIDs.size(); ++i) {
-      PRECICE_ASSERT(clusterIDs[i] < static_cast<int>(_clusters.size()));
-      _clusters[clusterIDs[i]].setNormalizedWeight(normalizedWeights[i], vertex.getID());
+      if (_useAnisotropic) {
+        PRECICE_ASSERT(clusterIDs[i] < static_cast<int>(_clusters.size()));
+        _clusters[clusterIDs[i]].setNormalizedWeight(normalizedWeights[i], vertex.getID());
+      } else {
+        PRECICE_ASSERT(clusterIDs[i] < static_cast<int>(_clustersSpherical.size()));
+        _clustersSpherical[clusterIDs[i]].setNormalizedWeight(normalizedWeights[i], vertex.getID());
+      }
     }
   }
   eWeights.stop();
 
-  e4.stop();
   // Uncomment to add a VTK export of the cluster center distribution for visualization purposes
   exportClusterCentersAsVTU(*_centerMesh);
 
@@ -274,7 +313,7 @@ std::pair<std::vector<int>, std::vector<double>> PartitionOfUnityMapping<RADIAL_
 
   // Step 2: find all clusters the output vertex lies in
   // Step 2a: get the relevant clusters for the output vertex (COARSE FILTER)
-  auto       candidateClusterIDs   = clusterIndex.getVerticesInsideBox(vertex, _coverSearchRadius);
+  auto       candidateClusterIDs   = clusterIndex.getVerticesInsideBox(vertex, _useAnisotropic ? _coverSearchRadius : _clusterRadius);
   // PRECICE_INFO("candidateClusterIDs.size() = {}", candidateClusterIDs.size());
 
   // Step 2b: Fine Filter + Compute Weights
@@ -282,10 +321,15 @@ std::pair<std::vector<int>, std::vector<double>> PartitionOfUnityMapping<RADIAL_
   std::vector<double> weights;
   
   for(auto id : candidateClusterIDs) {
+    if (_useAnisotropic) {
       if(_clusters[id].isCovering(vertex)) {
           clusterIDs.push_back(id);
           weights.push_back(_clusters[id].computeWeight(vertex));
       }
+    } else {
+      clusterIDs.push_back(id);
+      weights.push_back(_clustersSpherical[id].computeWeight(vertex));
+    }
   }
   
   const auto localNumberOfClusters = clusterIDs.size();
@@ -330,7 +374,11 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::mapConservative(const tim
   PRECICE_ASSERT(outData.isZero());
 
   // 2. Iterate over all clusters and accumulate the result in the output data
-  std::for_each(_clusters.begin(), _clusters.end(), [&](auto &cluster) { cluster.mapConservative(inData, outData); });
+  if (_useAnisotropic) {
+    std::for_each(_clusters.begin(), _clusters.end(), [&](auto &cluster) { cluster.mapConservative(inData, outData); });
+  } else {
+    std::for_each(_clustersSpherical.begin(), _clustersSpherical.end(), [&](auto &cluster) { cluster.mapConservative(inData, outData); });
+  }
 }
 
 template <typename RADIAL_BASIS_FUNCTION_T>
@@ -345,7 +393,11 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::mapConsistent(const time:
   PRECICE_ASSERT(outData.isZero());
 
   // 2. Execute the actual mapping evaluation in all vertex clusters and accumulate the data
-  std::for_each(_clusters.begin(), _clusters.end(), [&](auto &clusters) { clusters.mapConsistent(inData, outData); });
+  if (_useAnisotropic) {
+    std::for_each(_clusters.begin(), _clusters.end(), [&](auto &clusters) { clusters.mapConsistent(inData, outData); });
+  } else {
+    std::for_each(_clustersSpherical.begin(), _clustersSpherical.end(), [&](auto &clusters) { clusters.mapConsistent(inData, outData); });
+  }
 }
 
 template <typename RADIAL_BASIS_FUNCTION_T>
@@ -357,8 +409,8 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::mapConservativeAt(const E
 
   PRECICE_TRACE();
   PRECICE_ASSERT(_centerMesh);
-  PRECICE_ASSERT(cache.p.size() == _clusters.size());
-  PRECICE_ASSERT(cache.polynomialContributions.size() == _clusters.size());
+  PRECICE_ASSERT(cache.p.size() == (_useAnisotropic ? _clusters.size() : _clustersSpherical.size()));
+  PRECICE_ASSERT(cache.polynomialContributions.size() == (_useAnisotropic ? _clusters.size() : _clustersSpherical.size()));
 
   mesh::Vertex vertex(coordinates.col(0), -1);
   for (Eigen::Index v = 0; v < coordinates.cols(); ++v) {
@@ -366,11 +418,15 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::mapConservativeAt(const E
     auto [clusterIDs, normalizedWeights] = computeNormalizedWeight(vertex, this->input()->getName());
     // Use the weight to interpolate the solution
     for (std::size_t i = 0; i < clusterIDs.size(); ++i) {
-      PRECICE_ASSERT(clusterIDs[i] < static_cast<int>(_clusters.size()));
       auto id = clusterIDs[i];
-      // the input mesh refers here to a consistent constraint
       Eigen::VectorXd res = normalizedWeights[i] * source.col(v);
-      _clusters[id].addWriteDataToCache(vertex, res, cache.polynomialContributions[id], cache.p[id], *this->output().get());
+      if (_useAnisotropic) {
+        PRECICE_ASSERT(id < static_cast<int>(_clusters.size()));
+        _clusters[id].addWriteDataToCache(vertex, res, cache.polynomialContributions[id], cache.p[id], *this->output().get());
+      } else {
+        PRECICE_ASSERT(id < static_cast<int>(_clustersSpherical.size()));
+        _clustersSpherical[id].addWriteDataToCache(vertex, res, cache.polynomialContributions[id], cache.p[id], *this->output().get());
+      }
     }
   }
 }
@@ -396,10 +452,17 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::initializeMappingDataCach
 {
   PRECICE_TRACE();
   PRECICE_ASSERT(_hasComputedMapping);
-  cache.p.resize(_clusters.size());
-  cache.polynomialContributions.resize(_clusters.size());
-  for (std::size_t c = 0; c < _clusters.size(); ++c) {
-    _clusters[c].initializeCacheData(cache.polynomialContributions[c], cache.p[c], cache.getDataDimensions());
+  const auto nC = _useAnisotropic ? _clusters.size() : _clustersSpherical.size();
+  cache.p.resize(nC);
+  cache.polynomialContributions.resize(nC);
+  if (_useAnisotropic) {
+    for (std::size_t c = 0; c < _clusters.size(); ++c) {
+      _clusters[c].initializeCacheData(cache.polynomialContributions[c], cache.p[c], cache.getDataDimensions());
+    }
+  } else {
+    for (std::size_t c = 0; c < _clustersSpherical.size(); ++c) {
+      _clustersSpherical[c].initializeCacheData(cache.polynomialContributions[c], cache.p[c], cache.getDataDimensions());
+    }
   }
 }
 
@@ -408,11 +471,18 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::updateMappingDataCache(im
 {
   // We cannot synchronize this event, as the call to this function is rank-local only
   precice::profiling::Event e("map.pou.updateMappingDataCache.From" + input()->getName());
-  PRECICE_ASSERT(cache.p.size() == _clusters.size());
-  PRECICE_ASSERT(cache.polynomialContributions.size() == _clusters.size());
+  const auto nC = _useAnisotropic ? _clusters.size() : _clustersSpherical.size();
+  PRECICE_ASSERT(cache.p.size() == nC);
+  PRECICE_ASSERT(cache.polynomialContributions.size() == nC);
   Eigen::Map<const Eigen::MatrixXd> inMatrix(in.data(), cache.getDataDimensions(), in.size() / cache.getDataDimensions());
-  for (std::size_t c = 0; c < _clusters.size(); ++c) {
-    _clusters[c].computeCacheData(inMatrix, cache.polynomialContributions[c], cache.p[c]);
+  if (_useAnisotropic) {
+    for (std::size_t c = 0; c < _clusters.size(); ++c) {
+      _clusters[c].computeCacheData(inMatrix, cache.polynomialContributions[c], cache.p[c]);
+    }
+  } else {
+    for (std::size_t c = 0; c < _clustersSpherical.size(); ++c) {
+      _clustersSpherical[c].computeCacheData(inMatrix, cache.polynomialContributions[c], cache.p[c]);
+    }
   }
 }
 
@@ -561,8 +631,10 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::clear()
 {
   PRECICE_TRACE();
   _clusters.clear();
+  _clustersSpherical.clear();
   // TODO: Don't reset this here
   _coverSearchRadius            = 0;
+  _clusterRadius                = 0;
   this->_hasComputedMapping = false;
 }
 

@@ -76,7 +76,7 @@
             }
         },
         {
-            "name": "development-install",
+            "name": "dev",
             "description": "",
             "displayName": "",
             "inherits": [

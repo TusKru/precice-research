@@ -166,6 +166,9 @@ AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::AnisotropicVertexCluster(
         return;
     }
 
+    PRECICE_DEBUG("AnisotropicVertexCluster input size: {}", _inputIDs.size());
+    PRECICE_DEBUG("AnisotropicVertexCluster output size: {}", _outputIDs.size());
+
     // 3. Re-initialize RBF Solver
     std::vector<bool> deadAxis(inMesh->getDimensions(), false);
     precice::profiling::Event e("map.pou.computeMapping.rbfSolver");
@@ -312,16 +315,18 @@ double AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeD2(const mesh::
 template <typename RADIAL_BASIS_FUNCTION_T>
 double AnisotropicVertexCluster<RADIAL_BASIS_FUNCTION_T>::computeWeight(const mesh::Vertex &v) const
 {
+    // 原逻辑，使用马氏距离，只看椭球范围内的“相对距离”
     const double d2 = computeD2(v);
 
     if (d2 > 1.0) {
         return 0.0;
     } else {
-        // Use CompactPolynomialC2 to ensure monotonic decrease and 0 boundary
-        // Formula: (1 - u)^4 * (4u + 1) where u = sqrt(d2)
-        // Since we normalized boundary to 1.0, we use supportRadius = 1.0
         return _weightingFunction.evaluate(std::sqrt(d2));
     }
+
+    // 新逻辑，使用实际欧氏距离
+    // auto res = computeSquaredDifference(_center.rawCoords(), v.rawCoords(), {{true, true, true}});
+    // return _weightingFunction.evaluate(std::sqrt(res));
 }
 
 template <typename RADIAL_BASIS_FUNCTION_T>

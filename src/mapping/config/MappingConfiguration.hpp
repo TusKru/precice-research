@@ -92,6 +92,12 @@ public:
     int                 verticesPerCluster{};
     double              relativeOverlap{};
     bool                projectToInput{};
+
+    bool                useDynamicRatio{};
+    bool                useAnisotropic{};
+    double              staticRatio1{};
+    double              staticRatio2{};
+
     BasisFunction       basisFunction{};
     double              supportRadius{};
     double              shapeParameter{};
@@ -172,6 +178,12 @@ private:
   const std::string ATTR_VERTICES_PER_CLUSTER = "vertices-per-cluster";
   const std::string ATTR_RELATIVE_OVERLAP     = "relative-overlap";
   const std::string ATTR_PROJECT_TO_INPUT     = "project-to-input";
+
+  const std::string ATTR_USE_DYNAMIC_RATIO        = "use-dynamic-ratio";
+  const std::string ATTR_USE_ANISOTROPIC      = "use-anisotropic";
+  const std::string ATTR_STATIC_RATIO1        = "static-ratio1";
+  const std::string ATTR_STATIC_RATIO2        = "static-ratio2";
+
 
   // We declare the basis function as subtag
   const std::string SUBTAG_BASIS_FUNCTION = "basis-function";
@@ -277,7 +289,11 @@ private:
                                        double solverRtol,
                                        double verticesPerCluster,
                                        double relativeOverlap,
-                                       bool   projectToInput) const;
+                                       bool   projectToInput,
+                                       bool   useDynamicRatio,
+                                       bool   useAnisotropic,
+                                       double staticRatio1,
+                                       double staticRatio2) const;
 
   void finishRBFConfiguration();
 
