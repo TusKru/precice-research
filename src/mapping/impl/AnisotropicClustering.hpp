@@ -4,6 +4,7 @@
 #include <random>
 #include <algorithm>
 #include <cmath>
+#include <unordered_map> //0128
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
 #include <Eigen/Geometry>
@@ -528,6 +529,98 @@ void tagEmptyAnisotropicClusters(
     });
 }
 
+struct CellKey {
+    int x;
+    int y;
+    int z;
+};
+
+struct CellKeyHash {
+    std::size_t operator()(const CellKey &key) const
+    {
+        std::size_t h1 = std::hash<int>{}(key.x);
+        std::size_t h2 = std::hash<int>{}(key.y);
+        std::size_t h3 = std::hash<int>{}(key.z);
+        return h1 ^ (h2 << 1) ^ (h3 << 2);
+    }
+};
+
+inline bool operator==(const CellKey &lhs, const CellKey &rhs)
+{
+    return lhs.x == rhs.x && lhs.y == rhs.y && lhs.z == rhs.z;
+}
+
+void tagDuplicateProjectedCenters(Vertices &clusterCenters, double threshold, int dim)
+{
+    PRECICE_ASSERT(threshold >= 0);
+    if (clusterCenters.empty() || threshold <= 0.0) {
+        return;
+    }
+
+    const double inverseCellSize = 1.0 / threshold;
+    const double thresholdSquared = threshold * threshold;
+    std::unordered_map<CellKey, std::vector<VertexID>, CellKeyHash> grid;
+
+    auto cellKeyForVertex = [&](const mesh::Vertex &v) {
+        int x = static_cast<int>(std::floor(v.coord(0) * inverseCellSize));
+        int y = static_cast<int>(std::floor(v.coord(1) * inverseCellSize));
+        int z = 0;
+        if (dim == 3) {
+            z = static_cast<int>(std::floor(v.coord(2) * inverseCellSize));
+        }
+        return CellKey{x, y, z};
+    };
+
+    for (VertexID idx = 0; idx < static_cast<VertexID>(clusterCenters.size()); ++idx) {
+        auto &center = clusterCenters[idx];
+        if (center.isTagged()) {
+            continue;
+        }
+
+        const auto key = cellKeyForVertex(center);
+        bool isDuplicate = false;
+        for (int dz = (dim == 3 ? -1 : 0); dz <= (dim == 3 ? 1 : 0); ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const CellKey neighborKey{key.x + dx, key.y + dy, key.z + dz};
+                    auto it = grid.find(neighborKey);
+                    if (it == grid.end()) {
+                        continue;
+                    }
+                    for (auto neighborId : it->second) {
+                        auto &neighbor = clusterCenters[neighborId];
+                        if (neighbor.isTagged()) {
+                            continue;
+                        }
+                        const double dxVal = center.coord(0) - neighbor.coord(0);
+                        const double dyVal = center.coord(1) - neighbor.coord(1);
+                        const double dzVal = dim == 3 ? (center.coord(2) - neighbor.coord(2)) : 0.0;
+                        const double distanceSquared = dxVal * dxVal + dyVal * dyVal + dzVal * dzVal;
+                        if (distanceSquared < thresholdSquared) {
+                            center.tag();
+                            isDuplicate = true;
+                            break;
+                        }
+                    }
+                    if (isDuplicate) {
+                        break;
+                    }
+                }
+                if (isDuplicate) {
+                    break;
+                }
+            }
+            if (isDuplicate) {
+                break;
+            }
+        }
+
+        if (!center.isTagged()) {
+            grid[key].push_back(idx);
+        }
+    }
+}
+
 } // namespace
 
 /**
@@ -564,6 +657,15 @@ inline std::tuple<GlobalAnisotropyParams, Vertices> createAnisotropicClustering(
     if (projectToInput) {
         // globalCandidates = projectAndUniqueCenters(globalCandidates, inMesh);
         projectClusterCentersToinputMesh(centers, inMesh);
+        const double coverageFactor = (dim == 3) ? std::sqrt(2.0) : std::sqrt(3.0);
+        Eigen::Vector3d effectiveRadii = params.semiAxes;
+        if (dim == 2) {
+            effectiveRadii.z() = 1.0;
+        }
+        Eigen::Vector3d step = coverageFactor * effectiveRadii * (1.0 - overlapRatio);
+        const double minStep = (dim == 2) ? std::min(step.x(), step.y()) : step.minCoeff();
+        const double duplicateThreshold = 0.4 * minStep;
+        tagDuplicateProjectedCenters(centers, duplicateThreshold, dim);
     }
     removeTaggedVertices(centers);
     // Vertices centers = filterEmptyAnisotropicClusters(globalCandidates, inMesh, params);
