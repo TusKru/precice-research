@@ -238,6 +238,14 @@ MappingConfiguration::MappingConfiguration(
                              .setDocumentation("Value between 0 and 1 indicating the relative overlap between clusters. A value of 0.15 is usually a good trade-off between accuracy and efficiency.");
   auto projectToInput = XMLAttribute<bool>(ATTR_PROJECT_TO_INPUT, true)
                             .setDocumentation("If enabled, places the cluster centers at the closest vertex of the input mesh. Should be enabled in case of non-uniform point distributions such as for shell structures.");
+  auto useDynamicRatio = XMLAttribute<bool>(ATTR_USE_DYNAMIC_RATIO, true)
+                          .setDocumentation("If enabled, activates thresholding behavior for PUM anisotropic clustering.");
+  auto useAnisotropic = XMLAttribute<bool>(ATTR_USE_ANISOTROPIC, false)
+                            .setDocumentation("If enabled, uses anisotropic clustering (V1). Otherwise uses spherical clustering (V0).");
+  auto staticRatio1 = XMLAttribute<double>(ATTR_STATIC_RATIO1, -1.0)
+                              .setDocumentation("Primary aspect ratio of the anisotropic clustering ellipsoid (only relevant if 'use-anisotropic' is enabled).");
+  auto staticRatio2 = XMLAttribute<double>(ATTR_STATIC_RATIO2, -1.0)
+                              .setDocumentation("Secondary aspect ratio of the anisotropic clustering ellipsoid (only relevant if 'use-anisotropic' is enabled).");
 
   auto attrGeoMultiscaleType = XMLAttribute<std::string>(ATTR_GEOMETRIC_MULTISCALE_TYPE)
                                    .setDocumentation("Type of geometric multiscale mapping. Either 'spread' or 'collect'.")
@@ -252,7 +260,7 @@ MappingConfiguration::MappingConfiguration(
   addAttributes(projectionTags, {attrFromMesh, attrToMesh, attrDirection, attrConstraint});
   addAttributes(rbfDirectTags, {attrFromMesh, attrToMesh, attrDirection, attrConstraint, attrPolynomial, attrXDead, attrYDead, attrZDead});
   addAttributes(rbfIterativeTags, {attrFromMesh, attrToMesh, attrDirection, attrConstraint, attrPolynomial, attrXDead, attrYDead, attrZDead, attrSolverRtol});
-  addAttributes(pumDirectTags, {attrFromMesh, attrToMesh, attrDirection, attrConstraint, attrPumPolynomial, verticesPerCluster, relativeOverlap, projectToInput});
+  addAttributes(pumDirectTags, {attrFromMesh, attrToMesh, attrDirection, attrConstraint, attrPumPolynomial, verticesPerCluster, relativeOverlap, projectToInput, useDynamicRatio, useAnisotropic, staticRatio1, staticRatio2});
   addAttributes(rbfAliasTag, {attrFromMesh, attrToMesh, attrDirection, attrConstraint, attrXDead, attrYDead, attrZDead});
   addAttributes(geoMultiscaleTags, {attrFromMesh, attrToMesh, attrDirection, attrConstraint, attrGeoMultiscaleType, attrGeoMultiscaleAxis, attrGeoMultiscaleRadius});
 
@@ -426,6 +434,10 @@ void MappingConfiguration::xmlTagCallback(
     int    verticesPerCluster = tag.getIntAttributeValue(ATTR_VERTICES_PER_CLUSTER, 100);
     double relativeOverlap    = tag.getDoubleAttributeValue(ATTR_RELATIVE_OVERLAP, 0.3);
     bool   projectToInput     = tag.getBooleanAttributeValue(ATTR_PROJECT_TO_INPUT, true);
+    bool   useDynamicRatio       = tag.getBooleanAttributeValue(ATTR_USE_DYNAMIC_RATIO, true);
+    bool   useAnisotropic     = tag.getBooleanAttributeValue(ATTR_USE_ANISOTROPIC, false);
+    double staticRatio1   = tag.getDoubleAttributeValue(ATTR_STATIC_RATIO1, -1.0);
+    double staticRatio2   = tag.getDoubleAttributeValue(ATTR_STATIC_RATIO2, -1.0);
 
     // Convert raw string into enum types as the constructors take enums
     if (constraint == CONSTRAINT_CONSERVATIVE) {
@@ -442,7 +454,7 @@ void MappingConfiguration::xmlTagCallback(
 
     ConfiguredMapping configuredMapping = createMapping(dir, type, fromMesh, toMesh, geoMultiscaleType, geoMultiscaleAxis, multiscaleRadius);
 
-    _rbfConfig = configureRBFMapping(type, strPolynomial, xDead, yDead, zDead, solverRtol, verticesPerCluster, relativeOverlap, projectToInput);
+    _rbfConfig = configureRBFMapping(type, strPolynomial, xDead, yDead, zDead, solverRtol, verticesPerCluster, relativeOverlap, projectToInput, useDynamicRatio, useAnisotropic, staticRatio1, staticRatio2);
 
     checkDuplicates(configuredMapping);
     _mappings.push_back(configuredMapping);
@@ -501,7 +513,11 @@ MappingConfiguration::RBFConfiguration MappingConfiguration::configureRBFMapping
                                                                                  double solverRtol,
                                                                                  double verticesPerCluster,
                                                                                  double relativeOverlap,
-                                                                                 bool   projectToInput) const
+                                                                                 bool   projectToInput,
+                                                                                 bool   useDynamicRatio,
+                                                                                 bool   useAnisotropic,
+                                                                                  double staticRatio1,
+                                                                                  double staticRatio2) const
 {
   RBFConfiguration rbfConfig;
 
@@ -535,6 +551,10 @@ MappingConfiguration::RBFConfiguration MappingConfiguration::configureRBFMapping
   rbfConfig.verticesPerCluster = verticesPerCluster;
   rbfConfig.relativeOverlap    = relativeOverlap;
   rbfConfig.projectToInput     = projectToInput;
+  rbfConfig.useDynamicRatio       = useDynamicRatio;
+  rbfConfig.useAnisotropic     = useAnisotropic;
+  rbfConfig.staticRatio1   = staticRatio1;
+  rbfConfig.staticRatio2   = staticRatio2;
 
   return rbfConfig;
 }
@@ -749,7 +769,7 @@ void MappingConfiguration::finishRBFConfiguration()
       PRECICE_CHECK(false, "The global-iterative RBF solver on a CPU requires a preCICE build with PETSc enabled.");
 #endif
     } else if (_rbfConfig.solver == RBFConfiguration::SystemSolver::PUMDirect) {
-      mapping.mapping = getRBFMapping<RBFBackend::PUM>(_rbfConfig.basisFunction, constraintValue, mapping.fromMesh->getDimensions(), _rbfConfig.supportRadius, _rbfConfig.shapeParameter, _rbfConfig.polynomial, _rbfConfig.verticesPerCluster, _rbfConfig.relativeOverlap, _rbfConfig.projectToInput);
+      mapping.mapping = getRBFMapping<RBFBackend::PUM>(_rbfConfig.basisFunction, constraintValue, mapping.fromMesh->getDimensions(), _rbfConfig.supportRadius, _rbfConfig.shapeParameter, _rbfConfig.polynomial, _rbfConfig.verticesPerCluster, _rbfConfig.relativeOverlap, _rbfConfig.projectToInput, _rbfConfig.useDynamicRatio, _rbfConfig.useAnisotropic, _rbfConfig.staticRatio1, _rbfConfig.staticRatio2);
     } else {
       PRECICE_UNREACHABLE("Unknown RBF solver.");
     }

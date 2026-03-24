@@ -76,14 +76,14 @@
             }
         },
         {
-            "name": "mainInstallation",
+            "name": "dev-tagDul",
             "description": "",
             "displayName": "",
             "inherits": [
                 "optimized-debug"
             ],
             "cacheVariables": {
-                "CMAKE_INSTALL_PREFIX": "~/software/precice-3.3.0default"
+                "CMAKE_INSTALL_PREFIX": "~/software/precice-dev-tagDul"
             }
         }
     ]
