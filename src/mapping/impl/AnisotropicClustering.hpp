@@ -14,8 +14,10 @@
 #include "AnisotropicVertexCluster.hpp"
 #include "precice/impl/Types.hpp"
 #include "mapping/RadialBasisFctSolver.hpp"
+#include "logging/Logger.hpp"
+#include "logging/LogMacros.hpp"
 
-#include "mapping/impl/CreateClustering.hpp" 
+#include "mapping/impl/CreateClustering.hpp"
 
 namespace precice::mapping::impl {
 
@@ -89,13 +91,15 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
     double staticRatio1,
     double staticRatio2)
 {
+    precice::logging::Logger _log{"impl::AnisotropicClustering::computeGlobalAnisotropyParams"};
+
     if (staticRatio1 >= 1.0 || staticRatio2 >= 1.0) {
-        printf("[Anisotropic DEBUG] GlobalAnisotropy: Using static anisotropic ratios [%f, %f].\n", staticRatio1, staticRatio2);
+        PRECICE_DEBUG("GlobalAnisotropy: Using static anisotropic ratios [{}, {}].", staticRatio1, staticRatio2);
     } else {
         if (useDynamicRatio) {
-            printf("[Anisotropic DEBUG] GlobalAnisotropy: Using dynamic anisotropic ratio based on local PCA analysis.\n");
+            PRECICE_DEBUG("GlobalAnisotropy: Using dynamic anisotropic ratio based on local PCA analysis.");
         } else {
-            printf("[Anisotropic DEBUG] GlobalAnisotropy: Using Geometry ratio.\n");
+            PRECICE_DEBUG("GlobalAnisotropy: Using Geometry ratio.");
         }
     }
 
@@ -173,7 +177,7 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
 
     // 全局统计与回退
     if(validPilots == 0) {
-        printf("[Info] GlobalAnisotropy: No anisotropic features found. Fallback to isotropic.\n");
+        PRECICE_INFO("GlobalAnisotropy: No anisotropic features found. Fallback to isotropic.");
         params.coverSearchRadius = baseRadius;
         double invRad2 = 1.0 / (baseRadius * baseRadius);
         params.inverseCovariance = Eigen::Matrix3d::Identity() * invRad2;
@@ -257,24 +261,31 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
         params.semiAxes(1) = baseRadius * 1.0 / norConstant;
         params.semiAxes(2) = params.semiAxes(1);
     } else {
-        geomRatio0 = semiAxesRatio(0) / semiAxesRatio(2);
-        geomRatio1 = semiAxesRatio(1) / semiAxesRatio(2);
+        geomRatio0 = semiAxesRatio(0) / semiAxesRatio(2);  // sqrt(λmax/λmin)
+        geomRatio1 = semiAxesRatio(1) / semiAxesRatio(2);  // sqrt(λmid/λmin)
 
-        // 默认使用几何或动态限制
-        if (useDynamicRatio) {
-            finalRatio0 = std::min(geomRatio0, dynamicMaxRatio);
-            finalRatio1 = std::min(geomRatio1, dynamicMaxRatio);
-        } else {
-            finalRatio0 = geomRatio0;
-            finalRatio1 = geomRatio1;
+        // 检测极端板状几何: GeomRatio 极大 (如 > 10000) 表示检测到极端各向异性
+        // 这种情况下使用各向异性椭球效果反而差，应回退到球形
+        const double EXTREME_RATIO_THRESHOLD = 10000.0;
+        if (geomRatio0 > EXTREME_RATIO_THRESHOLD || geomRatio1 > EXTREME_RATIO_THRESHOLD) {
+            PRECICE_DEBUG("Extreme plate geometry detected (GeomRatio: [{}, {}] > {}). Falling back to spherical.",
+                          geomRatio0, geomRatio1, EXTREME_RATIO_THRESHOLD);
+            params.fallbackToSpherical = true;
+            // 设置各向同性参数作为回退
+            params.rotation = Eigen::Matrix3d::Identity();
+            params.semiAxes = Eigen::Vector3d::Constant(baseRadius);
+            params.coverSearchRadius = baseRadius;
+            double invRad2 = 1.0 / (baseRadius * baseRadius);
+            params.inverseCovariance = Eigen::Matrix3d::Identity() * invRad2;
+            return params;
         }
-        // 独立应用静态比率覆盖
-        if (staticRatio1 >= 1.0) {
-            finalRatio0 = staticRatio1;
-        }
-        if (staticRatio2 >= 1.0) {
-            finalRatio1 = staticRatio2;
-        }
+
+        // 使用静态比率 (st1=1.0, st2=3.0 作为默认值)
+        // 若用户未设置 staticRatio (< 1.0)，则使用默认值
+        finalRatio0 = (staticRatio1 >= 1.0) ? staticRatio1 : 1.0;  // 默认 1.0
+        finalRatio1 = (staticRatio2 >= 1.0) ? staticRatio2 : 3.0;  // 默认 3.0
+
+        PRECICE_DEBUG("Using static ratios [{}, {}] (defaults: 1.0, 3.0)", finalRatio0, finalRatio1);
 
         norConstant = std::cbrt(finalRatio0 * finalRatio1 * 1.0);
 
@@ -283,16 +294,14 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
         params.semiAxes(2) = baseRadius * 1.0 / norConstant;
     }
     params.coverSearchRadius = params.semiAxes(0);
-    
-    printf("@@@@@@ GlobalAnisotropyParams @@@@@@\n");
-    printf("Pilots: %d/%d; Score: %.3f; AllowedRatio: %.3f\n", validPilots, nPos, coherenceScore, dynamicMaxRatio);
-    printf("useDynamicRatio: %d; GeomRatio: [%.2f, %.2f] -> FinalRatio: [%.2f, %.2f]\n", 
-           useDynamicRatio, geomRatio0, geomRatio1, finalRatio0, finalRatio1);
-    printf("Rotation Matrix R:\n");
-    printf("[%.4f %.4f %.4f]\n", R(0,0), R(0,1), R(0,2));
-    printf("[%.4f %.4f %.4f]\n", R(1,0), R(1,1), R(1,2));
-    printf("[%.4f %.4f %.4f]\n", R(2,0), R(2,1), R(2,2));
-    printf("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n");
+
+    PRECICE_DEBUG("AnisotropyParams: pilots={}/{}, score={}, allowedRatio={}", validPilots, nPos, coherenceScore, dynamicMaxRatio);
+    PRECICE_DEBUG("GeomRatio: [{}, {}] -> FinalRatio: [{}, {}]", geomRatio0, geomRatio1, finalRatio0, finalRatio1);
+    PRECICE_DEBUG("FallbackToSpherical: {}", params.fallbackToSpherical ? "YES" : "NO");
+    PRECICE_DEBUG("Rotation Matrix R:\n[{}, {}, {}]\n[{}, {}, {}]\n[{}, {}, {}]",
+                  R(0,0), R(0,1), R(0,2),
+                  R(1,0), R(1,1), R(1,2),
+                  R(2,0), R(2,1), R(2,2));
 
     // 逆协方差 M
     Eigen::Matrix3d S_inv2 = Eigen::Matrix3d::Zero();
@@ -637,17 +646,26 @@ inline std::tuple<GlobalAnisotropyParams, Vertices> createAnisotropicClustering(
     double staticRatio2) 
 {
     precice::logging::Logger _log{"impl::createAnisotropicClustering"};
+    const int dim = inMesh->getDimensions();
+
+    // Early exit for empty mesh - must check BEFORE getRtreeBounds()
+    if(inMesh->vertices().size() == 0) {
+        GlobalAnisotropyParams params;
+        params.rotation = Eigen::Matrix3d::Identity();
+        params.semiAxes = Eigen::Vector3d::Constant(1.0);
+        params.inverseCovariance = Eigen::Matrix3d::Identity();
+        params.coverSearchRadius = 1.0;
+        return {params, Vertices{mesh::Vertex(Eigen::VectorXd::Zero(dim), 0)}};
+    }
+
     // 1. Estimate Base Radius
     precice::mesh::BoundingBox globalBB = inMesh->index().getRtreeBounds();
-    const int dim = inMesh->getDimensions();
     double baseRadius = estimateClusterRadius(targetVerticesPerCluster, inMesh, globalBB);
-    
+
     // 2. Compute Global Anisotropy Params
     GlobalAnisotropyParams params = computeGlobalAnisotropyParams(inMesh, baseRadius, useDynamicRatio, staticRatio1, staticRatio2);
 
     // 3. Generate Cluster Centers
-    if(inMesh->vertices().size() == 0) 
-        return {params, Vertices{mesh::Vertex(Eigen::VectorXd::Zero(dim), 0)}};
     
     Vertices centers = createClusterCenters(globalBB, params, overlapRatio, dim);
     
@@ -669,8 +687,8 @@ inline std::tuple<GlobalAnisotropyParams, Vertices> createAnisotropicClustering(
     }
     removeTaggedVertices(centers);
     // Vertices centers = filterEmptyAnisotropicClusters(globalCandidates, inMesh, params);
-    printf("Generated %lu centers (Anisotropic)\n", centers.size());
-    
+    PRECICE_DEBUG("Generated {} centers (Anisotropic)", centers.size());
+
     return {params, centers};
 }
 
