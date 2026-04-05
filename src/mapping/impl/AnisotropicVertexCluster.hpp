@@ -19,7 +19,7 @@ struct GlobalAnisotropyParams {
   Eigen::Vector3d semiAxes;
   Eigen::Matrix3d inverseCovariance;
   double coverSearchRadius;
-  bool fallbackToSpherical{false};  // true when detected as extreme plate geometry
+  bool fallbackToSpherical{false};  // true when anisotropy is not reliable and spherical fallback should be used
 };
 
 template <typename RADIAL_BASIS_FUNCTION_T>

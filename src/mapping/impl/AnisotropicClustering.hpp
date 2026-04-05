@@ -88,6 +88,7 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
     const mesh::PtrMesh inMesh,
     double baseRadius,
     bool useDynamicRatio,
+    bool autoFallback,
     double staticRatio1,
     double staticRatio2)
 {
@@ -177,7 +178,12 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
 
     // 全局统计与回退
     if(validPilots == 0) {
-        PRECICE_INFO("GlobalAnisotropy: No anisotropic features found. Fallback to isotropic.");
+        if (autoFallback) {
+            PRECICE_INFO("GlobalAnisotropy: No reliable anisotropic features found. Fallback to spherical.");
+            params.fallbackToSpherical = true;
+        } else {
+            PRECICE_INFO("GlobalAnisotropy: No reliable anisotropic features found, but automatic fallback is disabled. Continuing with isotropic anisotropic-cluster parameters.");
+        }
         params.coverSearchRadius = baseRadius;
         double invRad2 = 1.0 / (baseRadius * baseRadius);
         params.inverseCovariance = Eigen::Matrix3d::Identity() * invRad2;
@@ -194,7 +200,11 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
     eigenvalues = eigenvalues.cwiseMax(1e-10);
     
     Eigen::Matrix3d R;
-    R << eigenvectors.col(2), eigenvectors.col(1), eigenvectors.col(0);
+    // Columns are the principal directions ordered by descending eigenvalue:
+    // col(0) = major axis, col(1) = secondary axis, col(2) = minor axis.
+    R.col(0) = eigenvectors.col(2);
+    R.col(1) = eigenvectors.col(1);
+    R.col(2) = eigenvectors.col(0);
     // --- 2D 模式下的旋转矩阵清洗 ---
     if (dim == 2) {
         // 强制 R 的结构为绕 Z 轴旋转
@@ -223,25 +233,26 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
     coherenceScore /= validPilots;
 
     // 动态限制 (Dynamic Limit)
-    const double minScoreThreshold = 0.4;
+    const double minScoreThreshold = 0.35;
     const double absoluteMinRatio  = 1.5;
-    const double absoluteMaxRatio  = 2.5; 
+    const double absoluteMaxRatio  = 3.5; 
 
     double dynamicMaxRatio = 1.0;
-    if (useDynamicRatio && coherenceScore > minScoreThreshold) {
-        double t = (coherenceScore - minScoreThreshold) / (1.0 - minScoreThreshold);
-        dynamicMaxRatio = absoluteMinRatio + (t * t) * (absoluteMaxRatio - absoluteMinRatio);
+    if (useDynamicRatio) {
+        dynamicMaxRatio = absoluteMinRatio;
+        if (coherenceScore > minScoreThreshold) {
+            double t = (coherenceScore - minScoreThreshold) / (1.0 - minScoreThreshold);
+            dynamicMaxRatio = absoluteMinRatio + (t * t) * (absoluteMaxRatio - absoluteMinRatio);
+        }
     }
     
-    // 排序: Lambda0 >= Lambda1 >= Lambda2
-    Eigen::Vector3d sortedEvals;
-    sortedEvals << eigenvalues(2), eigenvalues(1), eigenvalues(0);
     Eigen::Vector3d semiAxesRatio;
     semiAxesRatio(0) = std::sqrt(eigenvalues(2));
     semiAxesRatio(1) = std::sqrt(eigenvalues(1));
     semiAxesRatio(2) = std::sqrt(eigenvalues(0));
 
-    double geomRatio0, geomRatio1;
+    double geomRatio0 = 1.0;
+    double geomRatio1 = 1.0;
     double finalRatio0, finalRatio1;
     double norConstant;
     if (dim == 2) {
@@ -264,28 +275,22 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
         geomRatio0 = semiAxesRatio(0) / semiAxesRatio(2);  // sqrt(λmax/λmin)
         geomRatio1 = semiAxesRatio(1) / semiAxesRatio(2);  // sqrt(λmid/λmin)
 
-        // 检测极端板状几何: GeomRatio 极大 (如 > 10000) 表示检测到极端各向异性
-        // 这种情况下使用各向异性椭球效果反而差，应回退到球形
-        const double EXTREME_RATIO_THRESHOLD = 10000.0;
-        if (geomRatio0 > EXTREME_RATIO_THRESHOLD || geomRatio1 > EXTREME_RATIO_THRESHOLD) {
-            PRECICE_DEBUG("Extreme plate geometry detected (GeomRatio: [{}, {}] > {}). Falling back to spherical.",
-                          geomRatio0, geomRatio1, EXTREME_RATIO_THRESHOLD);
-            params.fallbackToSpherical = true;
-            // 设置各向同性参数作为回退
-            params.rotation = Eigen::Matrix3d::Identity();
-            params.semiAxes = Eigen::Vector3d::Constant(baseRadius);
-            params.coverSearchRadius = baseRadius;
-            double invRad2 = 1.0 / (baseRadius * baseRadius);
-            params.inverseCovariance = Eigen::Matrix3d::Identity() * invRad2;
-            return params;
+        if (useDynamicRatio) {
+            finalRatio0 = std::min(geomRatio0, dynamicMaxRatio);
+            finalRatio1 = std::min(geomRatio1, dynamicMaxRatio);
+        } else {
+            // Static/default 3D shape: the major axis is stretched, the others stay at the base scale.
+            finalRatio0 = (staticRatio1 >= 1.0) ? staticRatio1 : 3.0;
+            finalRatio1 = (staticRatio2 >= 1.0) ? staticRatio2 : 1.0;
         }
 
-        // 使用静态比率 (st1=1.0, st2=3.0 作为默认值)
-        // 若用户未设置 staticRatio (< 1.0)，则使用默认值
-        finalRatio0 = (staticRatio1 >= 1.0) ? staticRatio1 : 1.0;  // 默认 1.0
-        finalRatio1 = (staticRatio2 >= 1.0) ? staticRatio2 : 3.0;  // 默认 3.0
+        finalRatio0 = std::max(finalRatio0, 1.0);
+        finalRatio1 = std::max(finalRatio1, 1.0);
+        finalRatio1 = std::min(finalRatio1, finalRatio0);
 
-        PRECICE_DEBUG("Using static ratios [{}, {}] (defaults: 1.0, 3.0)", finalRatio0, finalRatio1);
+        PRECICE_DEBUG("Using 3D ratios [{}, {}] (geom=[{}, {}], dynamic={}, upperLimit={})",
+                      finalRatio0, finalRatio1, geomRatio0, geomRatio1,
+                      useDynamicRatio ? "ON" : "OFF", dynamicMaxRatio);
 
         norConstant = std::cbrt(finalRatio0 * finalRatio1 * 1.0);
 
@@ -293,7 +298,27 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
         params.semiAxes(1) = baseRadius * finalRatio1 / norConstant;
         params.semiAxes(2) = baseRadius * 1.0 / norConstant;
     }
-    params.coverSearchRadius = params.semiAxes(0);
+
+    const double fallbackCoherenceThreshold = 0.35;
+    const double fallbackAnisotropyThreshold = 1.15;
+    const bool noClearPrincipalAxis = (geomRatio0 < fallbackAnisotropyThreshold);
+    if (noClearPrincipalAxis || coherenceScore < fallbackCoherenceThreshold) {
+        if (autoFallback) {
+            PRECICE_INFO("GlobalAnisotropy: unreliable principal-axis estimate (geomRatio=[{}, {}], coherence={}). Fallback to spherical.",
+                         geomRatio0, geomRatio1, coherenceScore);
+            params.fallbackToSpherical = true;
+            params.rotation = Eigen::Matrix3d::Identity();
+            params.semiAxes = Eigen::Vector3d::Constant(baseRadius);
+            params.coverSearchRadius = baseRadius;
+            double invRad2 = 1.0 / (baseRadius * baseRadius);
+            params.inverseCovariance = Eigen::Matrix3d::Identity() * invRad2;
+            return params;
+        } else {
+            PRECICE_INFO("GlobalAnisotropy: unreliable principal-axis estimate (geomRatio=[{}, {}], coherence={}), but automatic fallback is disabled.",
+                         geomRatio0, geomRatio1, coherenceScore);
+        }
+    }
+    params.coverSearchRadius = params.semiAxes.maxCoeff();
 
     PRECICE_DEBUG("AnisotropyParams: pilots={}/{}, score={}, allowedRatio={}", validPilots, nPos, coherenceScore, dynamicMaxRatio);
     PRECICE_DEBUG("GeomRatio: [{}, {}] -> FinalRatio: [{}, {}]", geomRatio0, geomRatio1, finalRatio0, finalRatio1);
@@ -314,26 +339,35 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
 }
 
 /**
- * @brief Generate a local anisotropic cluster centers within the given bounds with the given radii and overlap.
- *        Cluster centers are generated in a Hexagonal Close Packing like structure for better packing.
+ * @brief Generate anisotropic cluster centers in the ellipsoid principal-axis frame.
+ *        The centers are placed on a Cartesian lattice in normalized coordinates,
+ *        which gives a coverage guarantee for overlap = 0 and preserves that guarantee
+ *        for any denser spacing induced by overlap > 0 or by ceil-based discretization.
  * 
- * @param[in] local_bounds The local bounding box (min, max) for cluster center generation.
- * @param[in] radii The base radii of the local cluster.
+ * @param[in] globalBB The global bounding box for cluster center generation.
+ * @param[in] params Global anisotropy parameters.
  * @param[in] overlap The overlap of the local cluster.
- * @return std::vector<Eigen::Vector3d> The localPosition of the local lattice.
+ * @param[in] dim Spatial dimension.
+ * @param[in] projectToInput Whether a later projection-to-input step is expected.
+ * @param[out] actualSpacing Optional actual lattice spacing in the principal-axis frame.
+ * @return Vertices The generated cluster centers in global coordinates.
  */
 Vertices createClusterCenters(
     const precice::mesh::BoundingBox& globalBB,
     const GlobalAnisotropyParams& params,
     double overlap,
-    int dim)
+    int dim,
+    bool projectToInput,
+    Eigen::Vector3d *actualSpacing = nullptr)
 {
-    // Define Transformation
+    PRECICE_ASSERT(overlap < 1.0);
+
+    // Define transformation.
     Eigen::Vector3d bbCenter = globalBB.center();
     Eigen::Matrix3d T_inv = params.rotation.transpose();
     const Eigen::Vector3d& radii = params.semiAxes;
     
-    // Calculate Local Generation Bounds
+    // Calculate local bounds in the principal-axis frame.
     Eigen::Vector3d local_min = Eigen::Vector3d::Constant(std::numeric_limits<double>::max());
     Eigen::Vector3d local_max = Eigen::Vector3d::Constant(std::numeric_limits<double>::lowest());
         
@@ -352,78 +386,58 @@ Vertices createClusterCenters(
         local_min = local_min.cwiseMin(p_local);
         local_max = local_max.cwiseMax(p_local);
     }
-    
-    local_min -= params.semiAxes;
-    local_max += params.semiAxes;
 
-    const std::pair<Eigen::Vector3d, Eigen::Vector3d>& local_bounds = {local_min, local_max};
-
-    std::vector<Eigen::Vector3d> localPosition;
-
-    // 理论上：
-    // 2D 六边形密铺要无缝覆盖，间距(Step)最大为 sqrt(3)*R ≈ 1.732*R
-    // 3D FCC密铺要无缝覆盖，间距(Step)最大为 sqrt(2)*R ≈ 1.414*R
-    // 为了保证 overlap=0 时完全覆盖，使用几何覆盖因数。
-    double coverage_factor = (dim == 3) ? std::sqrt(2.0) : std::sqrt(3.0);
-    
-    Eigen::Vector3d effective_radii = radii;
-
+    Eigen::Vector3d effectiveRadii = radii;
     if (dim == 2) {
-        effective_radii.z() = 1.0; // 虚拟值，防止计算 step 出错
-    }
-    
-    // 当 overlap=0, Step = coverage_factor * R (紧密咬合以覆盖空隙)
-    Eigen::Vector3d step = coverage_factor * effective_radii * (1.0 - overlap);
-
-    if(step.minCoeff() <= 1e-9) return Vertices{mesh::Vertex({globalBB.center(), 0})}; // 安全检查
-
-    const auto& min = local_bounds.first;
-    const auto& max = local_bounds.second;
-
-    // 优化边界处理：向外扩展半个步长或一个半径，确保边界被覆盖
-    Eigen::Vector3d start_pos = min - 0.5 * step;
-    Eigen::Vector3d end_pos   = max + 0.5 * step;
-    
-    if (dim == 2) {
-        start_pos.z() = min.z(); // 通常 2D 模拟在一个平面上，保持 min.z
-        end_pos.z()   = min.z(); 
+        effectiveRadii.z() = 1.0;
+        local_min.z() = 0.0;
+        local_max.z() = 0.0;
     }
 
-    // 计算网格数量
-    int nz = 1;
-    if (dim == 3) {
-        nz = static_cast<int>(std::floor((end_pos.z() - start_pos.z()) / step.z())) + 2;
+    // In normalized coordinates y_i = x_i / r_i, the ellipsoid becomes a unit sphere.
+    // A Cartesian lattice with spacing 2 / sqrt(dim) is the just-touching coverage case.
+    const double normalizedSpacing = (2.0 / std::sqrt(static_cast<double>(dim))) * (1.0 - overlap);
+    Eigen::Vector3d maxStep = normalizedSpacing * effectiveRadii;
+
+    if (maxStep.minCoeff() <= 1e-9) {
+        return Vertices{mesh::Vertex({globalBB.center(), 0})};
     }
-    int ny = static_cast<int>(std::floor((end_pos.y() - start_pos.y()) / step.y())) + 2;
-    int nx = static_cast<int>(std::floor((end_pos.x() - start_pos.x()) / step.x())) + 2;
 
-    for (int k = 0; k < nz; ++k) {
-        double z = start_pos.z();
-        if (dim == 3) z += k * step.z();
+    std::array<unsigned int, 3> nClusters{1, 1, 1};
+    Eigen::Vector3d distances = Eigen::Vector3d::Zero();
+    Eigen::Vector3d start = local_min;
 
-        // 3D 交错逻辑 (FCC/HCP layer shift)
-        // 偶数层不偏，奇数层偏 (0.5, 0.5)
-        double layer_offset_y = 0.0;
-        double layer_offset_x = 0.0;
-        
-        if (dim == 3 && (k % 2 != 0)) {
-             layer_offset_y = step.y() * 0.5;
-             layer_offset_x = step.x() * 0.5;
+    for (int d = 0; d < dim; ++d) {
+        const double edgeLength = local_max[d] - local_min[d];
+        if (edgeLength <= math::NUMERICAL_ZERO_DIFFERENCE) {
+            nClusters[d] = 1;
+            distances[d] = 0.0;
+            continue;
         }
 
-        for (int j = 0; j < ny; ++j) {
-            double y = start_pos.y() + j * step.y() + layer_offset_y;
+        nClusters[d] = static_cast<unsigned int>(std::ceil(std::max(1.0, edgeLength / maxStep[d])));
+        distances[d] = edgeLength / static_cast<double>(nClusters[d]);
 
-            // 2D/3D 行交错逻辑 (Hexagonal row shift)
-            // 偶数行不偏，奇数行偏 0.5
-            double row_offset_x = (j % 2 != 0) ? step.x() * 0.5 : 0.0;
-            double total_offset_x = layer_offset_x + row_offset_x;
-            
-            // 归一化 offset，防止偏移过度
-            while(total_offset_x >= step.x()) total_offset_x -= step.x();
+        if (projectToInput) {
+            nClusters[d] += 1;
+        } else {
+            start[d] += 0.5 * distances[d];
+        }
+    }
 
-            for (int i = 0; i < nx; ++i) {
-                double x = start_pos.x() + i * step.x() + total_offset_x;
+    if (actualSpacing != nullptr) {
+        *actualSpacing = distances;
+    }
+
+    std::vector<Eigen::Vector3d> localPosition;
+    localPosition.reserve(static_cast<std::size_t>(nClusters[0]) * static_cast<std::size_t>(nClusters[1]) * static_cast<std::size_t>(nClusters[2]));
+
+    for (unsigned int k = 0; k < nClusters[2]; ++k) {
+        const double z = (dim == 3) ? (start.z() + static_cast<double>(k) * distances.z()) : 0.0;
+        for (unsigned int j = 0; j < nClusters[1]; ++j) {
+            const double y = start.y() + static_cast<double>(j) * distances.y();
+            for (unsigned int i = 0; i < nClusters[0]; ++i) {
+                const double x = start.x() + static_cast<double>(i) * distances.x();
                 localPosition.emplace_back(x, y, z);
             }
         }
@@ -642,6 +656,7 @@ inline std::tuple<GlobalAnisotropyParams, Vertices> createAnisotropicClustering(
     double overlapRatio,
     bool projectToInput,
     bool useDynamicRatio,
+    bool autoFallback,
     double staticRatio1,
     double staticRatio2) 
 {
@@ -663,27 +678,26 @@ inline std::tuple<GlobalAnisotropyParams, Vertices> createAnisotropicClustering(
     double baseRadius = estimateClusterRadius(targetVerticesPerCluster, inMesh, globalBB);
 
     // 2. Compute Global Anisotropy Params
-    GlobalAnisotropyParams params = computeGlobalAnisotropyParams(inMesh, baseRadius, useDynamicRatio, staticRatio1, staticRatio2);
+    GlobalAnisotropyParams params = computeGlobalAnisotropyParams(inMesh, baseRadius, useDynamicRatio, autoFallback, staticRatio1, staticRatio2);
 
     // 3. Generate Cluster Centers
     
-    Vertices centers = createClusterCenters(globalBB, params, overlapRatio, dim);
-    
-    // tagEmptyClusters(centers, params.semiAxes.minCoeff(), inMesh);
+    Eigen::Vector3d actualSpacing = Eigen::Vector3d::Zero();
+    Vertices centers = createClusterCenters(globalBB, params, overlapRatio, dim, projectToInput, &actualSpacing);
+
     tagEmptyAnisotropicClusters(centers, params, inMesh);
+    if (!outMesh->isJustInTime()) {
+        tagEmptyAnisotropicClusters(centers, params, outMesh);
+    }
 
     if (projectToInput) {
-        // globalCandidates = projectAndUniqueCenters(globalCandidates, inMesh);
         projectClusterCentersToinputMesh(centers, inMesh);
-        const double coverageFactor = (dim == 3) ? std::sqrt(2.0) : std::sqrt(3.0);
-        Eigen::Vector3d effectiveRadii = params.semiAxes;
-        if (dim == 2) {
-            effectiveRadii.z() = 1.0;
-        }
-        Eigen::Vector3d step = coverageFactor * effectiveRadii * (1.0 - overlapRatio);
-        const double minStep = (dim == 2) ? std::min(step.x(), step.y()) : step.minCoeff();
+        const double minStep = (dim == 2) ? std::min(actualSpacing.x(), actualSpacing.y()) : actualSpacing.head(dim).minCoeff();
         const double duplicateThreshold = 0.4 * minStep;
         tagDuplicateProjectedCenters(centers, duplicateThreshold, dim);
+        if (!outMesh->isJustInTime()) {
+            tagEmptyAnisotropicClusters(centers, params, outMesh);
+        }
     }
     removeTaggedVertices(centers);
     // Vertices centers = filterEmptyAnisotropicClusters(globalCandidates, inMesh, params);

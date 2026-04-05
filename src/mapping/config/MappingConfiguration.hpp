@@ -95,6 +95,7 @@ public:
 
     bool                useDynamicRatio{};
     bool                useAnisotropic{};
+    bool                autoFallback{true};
     double              staticRatio1{};
     double              staticRatio2{};
 
@@ -181,6 +182,7 @@ private:
 
   const std::string ATTR_USE_DYNAMIC_RATIO        = "use-dynamic-ratio";
   const std::string ATTR_USE_ANISOTROPIC      = "use-anisotropic";
+  const std::string ATTR_AUTO_FALLBACK        = "auto-fallback";
   const std::string ATTR_STATIC_RATIO1        = "static-ratio1";
   const std::string ATTR_STATIC_RATIO2        = "static-ratio2";
 
@@ -292,6 +294,7 @@ private:
                                        bool   projectToInput,
                                        bool   useDynamicRatio,
                                        bool   useAnisotropic,
+                                       bool   autoFallback,
                                        double staticRatio1,
                                        double staticRatio2) const;
 
