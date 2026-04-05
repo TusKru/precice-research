@@ -216,7 +216,7 @@ void PartitionOfUnityMapping<RADIAL_BASIS_FUNCTION_T>::computeMapping()
     _anisoParams           = params;
     if (useAnisotropicClusters()) {
       PRECICE_DEBUG("Using anisotropic partition-of-unity clustering with cover search radius {}.", params.coverSearchRadius);
-      _coverSearchRadius = params.coverSearchRadius; // Use max semi-axis as the conservative radius
+      _coverSearchRadius = params.coverSearchRadius; // Use the second-longest semi-axis for the coarse search radius
       centerCandidates   = std::move(centers);
       PRECICE_ASSERT(_coverSearchRadius > 0 || inMesh->nVertices() == 0 || outMesh->nVertices() == 0);
     } else {

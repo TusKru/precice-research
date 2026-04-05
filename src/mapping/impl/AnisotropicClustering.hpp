@@ -279,7 +279,7 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
             finalRatio0 = std::min(geomRatio0, dynamicMaxRatio);
             finalRatio1 = std::min(geomRatio1, dynamicMaxRatio);
         } else {
-            // Static/default 3D shape: the major axis is stretched, the others stay at the base scale.
+            // Static/default 3D shape: the major axis is stretched, the second axis stays at the base scale.
             finalRatio0 = (staticRatio1 >= 1.0) ? staticRatio1 : 3.0;
             finalRatio1 = (staticRatio2 >= 1.0) ? staticRatio2 : 1.0;
         }
@@ -318,7 +318,9 @@ GlobalAnisotropyParams computeGlobalAnisotropyParams(
                          geomRatio0, geomRatio1, coherenceScore);
         }
     }
-    params.coverSearchRadius = params.semiAxes.maxCoeff();
+    // Use the second-longest semi-axis as the coarse search radius.
+    // In 2D this coincides with the shortest physical axis.
+    params.coverSearchRadius = params.semiAxes(1);
 
     PRECICE_DEBUG("AnisotropyParams: pilots={}/{}, score={}, allowedRatio={}", validPilots, nPos, coherenceScore, dynamicMaxRatio);
     PRECICE_DEBUG("GeomRatio: [{}, {}] -> FinalRatio: [{}, {}]", geomRatio0, geomRatio1, finalRatio0, finalRatio1);
